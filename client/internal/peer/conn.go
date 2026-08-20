@@ -350,6 +350,43 @@ func (conn *Conn) Close(signalToRemote bool) {
 	conn.Log.Infof("peer connection closed")
 }
 
+// OnNetworkChange drops the ICE session bound to the transport the OS just
+// left. A handover silently invalidates ICE sockets, but the agent only
+// notices after its timeouts; closing it here collapses that wait and hands
+// the peer back to the relay immediately.
+func (conn *Conn) OnNetworkChange() {
+	conn.mu.Lock()
+
+	if !conn.opened || conn.ctx.Err() != nil || conn.workerICE == nil {
+		conn.mu.Unlock()
+		return
+	}
+
+	workerICE := conn.workerICE
+	iceWasConnected := conn.statusICE.Get() == worker.StatusConnected
+	conn.mu.Unlock()
+
+	// Close outside the lock: agent.Close() delivers a final state change
+	// whose handler re-takes conn.mu.
+	workerICE.OnNetworkChange()
+
+	// Still negotiating — nothing to unwind; the guard wakes on its own.
+	if !iceWasConnected {
+		return
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	// Re-check: the connection may have been closed or reopened while unlocked.
+	if !conn.opened || conn.workerICE != workerICE {
+		return
+	}
+
+	// sessionChanged: the worker rotated its session ID on close.
+	conn.handleICEDisconnectedLocked(true)
+}
+
 // OnRemoteAnswer handles an offer from the remote peer and returns true if the message was accepted, false otherwise
 // doesn't block, discards the message if connection wasn't ready
 func (conn *Conn) OnRemoteAnswer(answer OfferAnswer) {
@@ -495,7 +532,11 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+	conn.handleICEDisconnectedLocked(sessionChanged)
+}
 
+// handleICEDisconnectedLocked handles ICE disconnection. Caller must hold conn.mu.
+func (conn *Conn) handleICEDisconnectedLocked(sessionChanged bool) {
 	if conn.ctx.Err() != nil {
 		return
 	}

@@ -212,6 +212,44 @@ func (w *WorkerICE) Close() {
 	w.agent = nil
 }
 
+// OnNetworkChange tears down the ICE session bound to the transport the OS
+// just left. A handover silently invalidates the sockets, so letting the agent
+// notice on its own costs DisconnectedTimeout plus FailedTimeout before
+// reconnect logic is woken. The session ID is rotated so the remote peer
+// treats our next offer as new, not a duplicate of the dead one.
+//
+// The agent is detached under the lock and closed after releasing it: closing
+// makes pion deliver a final state change whose handler takes the same lock.
+func (w *WorkerICE) OnNetworkChange() {
+	w.muxAgent.Lock()
+	if w.agent == nil {
+		w.muxAgent.Unlock()
+		return
+	}
+
+	agent := w.agent
+	cancel := w.agentDialerCancel
+	w.agent = nil
+	w.agentConnecting = false
+	// Suppress the disconnect handling the final state change would trigger:
+	// the caller is already tearing the transports down.
+	w.lastKnownState = ice.ConnectionStateClosed
+
+	sessionID, err := NewICESessionID()
+	if err != nil {
+		w.log.Errorf("failed to create new session ID: %s", err)
+	} else {
+		w.sessionID = sessionID
+	}
+	w.muxAgent.Unlock()
+
+	w.log.Infof("network transport changed, closing ICE agent")
+	cancel()
+	if err := agent.Close(); err != nil {
+		w.log.Warnf("failed to close ICE agent on network change: %s", err)
+	}
+}
+
 func (w *WorkerICE) reCreateAgent(dialerCancel context.CancelFunc, candidates []ice.CandidateType) (*icemaker.ThreadSafeAgent, error) {
 	w.portForwardAttempted = false
 
