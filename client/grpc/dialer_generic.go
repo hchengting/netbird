@@ -59,9 +59,9 @@ func dialContext(ctx context.Context, addr string) (net.Conn, error) {
 		}
 	}
 
-	conn, err := nbnet.NewDialer().DialContext(ctx, "tcp", addr)
+	conn, err := nbnet.NewControlPlaneDialer().DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("nbnet.NewDialer().DialContext: %w", err)
+		return nil, fmt.Errorf("nbnet.NewControlPlaneDialer().DialContext: %w", err)
 	}
 	return conn, nil
 }

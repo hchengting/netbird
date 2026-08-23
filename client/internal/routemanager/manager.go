@@ -242,7 +242,7 @@ func (m *DefaultManager) Init() error {
 		initialAddresses = append(initialAddresses, m.relayMgr.ServerURLs()...)
 	}
 
-	ips := resolveURLsToIPs(initialAddresses)
+	ips := resolveURLsToIPs(m.ctx, nbnet.NewControlPlaneDialer(), initialAddresses)
 
 	if err := m.sysOps.SetupRouting(ips, m.stateManager, nbnet.AdvancedRouting()); err != nil {
 		return fmt.Errorf("setup routing: %w", err)
@@ -705,21 +705,49 @@ func isRouteSupported(route *route.Route) bool {
 	return true
 }
 
-// resolveURLsToIPs takes a slice of URLs, resolves them to IP addresses and returns a slice of IPs.
-func resolveURLsToIPs(urls []string) []net.IP {
+type hostResolver interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+// resolveURLsToIPs takes a slice of URLs, resolves each unique host, and
+// returns unique IP addresses in resolver order.
+func resolveURLsToIPs(ctx context.Context, resolver hostResolver, urls []string) []net.IP {
 	var ips []net.IP
+	seenHosts := make(map[string]struct{}, len(urls))
+	seenIPs := make(map[netip.Addr]struct{})
 	for _, rawurl := range urls {
 		u, err := url.Parse(rawurl)
 		if err != nil {
-			log.Errorf("Failed to parse url %s: %v", rawurl, err)
+			log.Debugf("Failed to parse control-plane URL: %v", err)
 			continue
 		}
-		ipAddrs, err := net.LookupIP(u.Hostname())
+
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			log.Debug("Control-plane URL has no hostname")
+			continue
+		}
+		if _, ok := seenHosts[host]; ok {
+			continue
+		}
+		seenHosts[host] = struct{}{}
+
+		ipAddrs, err := resolver.LookupNetIP(ctx, "ip", host)
 		if err != nil {
-			log.Errorf("Failed to resolve host %s: %v", u.Hostname(), err)
+			log.Debugf("Failed to resolve control-plane host: %v", err)
 			continue
 		}
-		ips = append(ips, ipAddrs...)
+		for _, ip := range ipAddrs {
+			if !ip.IsValid() {
+				continue
+			}
+			ip = ip.Unmap()
+			if _, ok := seenIPs[ip]; ok {
+				continue
+			}
+			seenIPs[ip] = struct{}{}
+			ips = append(ips, net.IP(ip.AsSlice()))
+		}
 	}
 	return ips
 }

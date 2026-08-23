@@ -3,6 +3,9 @@ package mgmt
 import (
 	"context"
 	"errors"
+	"net/netip"
+	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +17,66 @@ import (
 	dnsconfig "github.com/netbirdio/netbird/client/internal/dns/config"
 	"github.com/netbirdio/netbird/shared/management/domain"
 )
+
+type hostResolverFunc func(ctx context.Context, network, host string) ([]netip.Addr, error)
+
+func (f hostResolverFunc) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return f(ctx, network, host)
+}
+
+func TestResolver_ControlPlaneDomainsUseDedicatedResolver(t *testing.T) {
+	var resolverMu sync.Mutex
+	resolverCalls := make(map[string]int)
+	controlResolver := hostResolverFunc(func(_ context.Context, network, host string) ([]netip.Addr, error) {
+		resolverMu.Lock()
+		resolverCalls[host+"|"+network]++
+		resolverMu.Unlock()
+		switch network {
+		case "ip4":
+			return []netip.Addr{netip.MustParseAddr("192.0.2.80")}, nil
+		case "ip6":
+			return []netip.Addr{netip.MustParseAddr("2001:db8::80")}, nil
+		default:
+			t.Fatalf("LookupNetIP() network = %q", network)
+			return nil, nil
+		}
+	})
+	r := newResolver(controlResolver)
+	chain := newFakeChain()
+	for _, host := range []string{"management.example.com", "signal.example.com", "relay.example.com", "stun.example.com"} {
+		chain.setAnswer(host+".", dns.TypeA, "10.0.0.2")
+		chain.setAnswer(host+".", dns.TypeAAAA, "2001:db8::2")
+	}
+	r.SetChainResolver(chain, 50)
+
+	managementURL, err := url.Parse("https://management.example.com:443")
+	require.NoError(t, err)
+	require.NoError(t, r.PopulateFromConfig(context.Background(), managementURL))
+
+	_, err = r.UpdateFromServerDomains(context.Background(), dnsconfig.ServerDomains{
+		Signal: domain.Domain("signal.example.com"),
+		Relay:  []domain.Domain{"relay.example.com"},
+		Stuns:  []domain.Domain{"stun.example.com"},
+	})
+	require.NoError(t, err)
+
+	resolverCallCount := func(key string) int {
+		resolverMu.Lock()
+		defer resolverMu.Unlock()
+		return resolverCalls[key]
+	}
+
+	for _, host := range []string{"management.example.com", "signal.example.com", "relay.example.com"} {
+		assert.Equal(t, 1, resolverCallCount(host+"|ip4"))
+		assert.Equal(t, 1, resolverCallCount(host+"|ip6"))
+		assert.Equal(t, 0, chain.callCount(host+".", dns.TypeA))
+		assert.Equal(t, "192.0.2.80", firstA(t, queryA(t, r, host+".")))
+	}
+
+	assert.Equal(t, 0, resolverCallCount("stun.example.com|ip4"))
+	assert.Equal(t, 1, chain.callCount("stun.example.com.", dns.TypeA))
+	assert.Equal(t, "10.0.0.2", firstA(t, queryA(t, r, "stun.example.com.")))
+}
 
 // A domain already in the cache must not be re-resolved on a subsequent server
 // domains update; it is left to the stale-while-revalidate refresh path.

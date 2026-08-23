@@ -82,7 +82,7 @@ func prepareURL(address string) (string, error) {
 // underlyingOut, when non-nil, is populated with the raw conn from the
 // transport's DialContext so the caller can read its RemoteAddr.
 func httpClientNbDialer(serverName string, underlyingOut *net.Conn) *http.Client {
-	customDialer := nbnet.NewDialer()
+	customDialer := nbnet.NewControlPlaneDialer()
 
 	certPool, err := x509.SystemCertPool()
 	if err != nil || certPool == nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"slices"
@@ -39,6 +40,10 @@ type ChainResolver interface {
 	HasRootHandlerAtOrBelow(maxPriority int) bool
 }
 
+type hostResolver interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
 // cachedRecord holds DNS records plus timestamps used for TTL refresh.
 // records and cachedAt are set at construction and treated as immutable;
 // lastFailedRefresh and consecFailures are mutable and must be accessed under
@@ -67,6 +72,7 @@ type Resolver struct {
 
 	chain            ChainResolver
 	chainMaxPriority int
+	controlResolver  hostResolver
 	refreshGroup     singleflight.Group
 
 	// refreshing tracks questions whose refresh is running via the OS
@@ -82,11 +88,16 @@ type Resolver struct {
 
 // NewResolver creates a new management domains cache resolver.
 func NewResolver() *Resolver {
+	return newResolver(newPlatformControlPlaneResolver())
+}
+
+func newResolver(controlResolver hostResolver) *Resolver {
 	return &Resolver{
-		records:        make(map[dns.Question]*cachedRecord),
-		refreshing:     make(map[dns.Question]*atomic.Bool),
-		failedResolves: make(map[domain.Domain]time.Time),
-		cacheTTL:       resolveCacheTTL(),
+		records:         make(map[dns.Question]*cachedRecord),
+		refreshing:      make(map[dns.Question]*atomic.Bool),
+		failedResolves:  make(map[domain.Domain]time.Time),
+		cacheTTL:        resolveCacheTTL(),
+		controlResolver: controlResolver,
 	}
 }
 
@@ -329,13 +340,19 @@ func (m *Resolver) markRefreshFailed(question dns.Question, expected *cachedReco
 	return c.consecFailures
 }
 
-// lookupBoth resolves A and AAAA via chain or OS. Per-family errors let
+// lookupBoth resolves A and AAAA via the dedicated control-plane resolver,
+// handler chain, or OS. Per-family errors let
 // callers tell records, NODATA (nil err, no records), and failure apart.
 func (m *Resolver) lookupBoth(ctx context.Context, d domain.Domain, dnsName string) (aRecords, aaaaRecords []dns.RR, errA, errAAAA error) {
 	m.mutex.RLock()
 	chain := m.chain
 	maxPriority := m.chainMaxPriority
+	controlResolver := m.controlResolverForDomainLocked(d)
 	m.mutex.RUnlock()
+
+	if controlResolver != nil {
+		return m.lookupBothViaHost(ctx, controlResolver, d, dnsName)
+	}
 
 	if chain != nil && chain.HasRootHandlerAtOrBelow(maxPriority) {
 		aRecords, errA = m.lookupViaChain(ctx, chain, maxPriority, dnsName, dns.TypeA)
@@ -358,7 +375,12 @@ func (m *Resolver) lookupRecords(ctx context.Context, d domain.Domain, q dns.Que
 	m.mutex.RLock()
 	chain := m.chain
 	maxPriority := m.chainMaxPriority
+	controlResolver := m.controlResolverForDomainLocked(d)
 	m.mutex.RUnlock()
+
+	if controlResolver != nil {
+		return m.hostLookup(ctx, controlResolver, d, q.Name, q.Qtype)
+	}
 
 	if chain != nil && chain.HasRootHandlerAtOrBelow(maxPriority) {
 		return m.lookupViaChain(ctx, chain, maxPriority, q.Name, q.Qtype)
@@ -412,6 +434,36 @@ func (m *Resolver) lookupViaChain(ctx context.Context, chain ChainResolver, maxP
 // which disambiguates NODATA from NXDOMAIN and Unmaps v4-mapped-v6. NODATA
 // returns (nil, nil).
 func (m *Resolver) osLookup(ctx context.Context, d domain.Domain, dnsName string, qtype uint16) ([]dns.RR, error) {
+	return m.hostLookup(ctx, net.DefaultResolver, d, dnsName, qtype)
+}
+
+type familyLookupResult struct {
+	qtype   uint16
+	records []dns.RR
+	err     error
+}
+
+func (m *Resolver) lookupBothViaHost(ctx context.Context, resolver hostResolver, d domain.Domain, dnsName string) (aRecords, aaaaRecords []dns.RR, errA, errAAAA error) {
+	results := make(chan familyLookupResult, 2)
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		go func() {
+			records, err := m.hostLookup(ctx, resolver, d, dnsName, qtype)
+			results <- familyLookupResult{qtype: qtype, records: records, err: err}
+		}()
+	}
+
+	for range 2 {
+		result := <-results
+		if result.qtype == dns.TypeA {
+			aRecords, errA = result.records, result.err
+		} else {
+			aaaaRecords, errAAAA = result.records, result.err
+		}
+	}
+	return
+}
+
+func (m *Resolver) hostLookup(ctx context.Context, resolver hostResolver, d domain.Domain, dnsName string, qtype uint16) ([]dns.RR, error) {
 	network := resutil.NetworkForQtype(qtype)
 	if network == "" {
 		return nil, fmt.Errorf("unsupported qtype %s", dns.TypeToString[qtype])
@@ -420,7 +472,7 @@ func (m *Resolver) osLookup(ctx context.Context, d domain.Domain, dnsName string
 	log.Infof("looking up IP for mgmt domain=%s type=%s", d.SafeString(), dns.TypeToString[qtype])
 	defer log.Infof("done looking up IP for mgmt domain=%s type=%s", d.SafeString(), dns.TypeToString[qtype])
 
-	result := resutil.LookupIP(ctx, net.DefaultResolver, network, d.PunycodeString(), qtype)
+	result := resutil.LookupIP(ctx, resolver, network, d.PunycodeString(), qtype)
 	if result.Rcode == dns.RcodeSuccess {
 		return resutil.IPsToRRs(dnsName, result.IPs, uint32(m.cacheTTL.Seconds())), nil
 	}
@@ -429,6 +481,24 @@ func (m *Resolver) osLookup(ctx context.Context, d domain.Domain, dnsName string
 		return nil, fmt.Errorf("resolve %s type=%s: %w", d.SafeString(), dns.TypeToString[qtype], result.Err)
 	}
 	return nil, fmt.Errorf("resolve %s type=%s: rcode=%s", d.SafeString(), dns.TypeToString[qtype], dns.RcodeToString[result.Rcode])
+}
+
+// controlResolverForDomainLocked returns the Android-only resolver for
+// management, signal, and relay domains. Caller holds m.mutex for reading.
+func (m *Resolver) controlResolverForDomainLocked(d domain.Domain) hostResolver {
+	if m.controlResolver == nil {
+		return nil
+	}
+	if m.mgmtDomain != nil && d == *m.mgmtDomain {
+		return m.controlResolver
+	}
+	if m.serverDomains == nil {
+		return nil
+	}
+	if d == m.serverDomains.Signal || slices.Contains(m.serverDomains.Relay, d) {
+		return m.controlResolver
+	}
+	return nil
 }
 
 // responseTTL returns the remaining cache lifetime in seconds (rounded up),
