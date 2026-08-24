@@ -57,14 +57,14 @@ func TestEvalConnStatus_ICEUnavailable(t *testing.T) {
 		want guard.ConnStatus
 	}{
 		{
-			name: "remote does not support ICE, peer uses relay, relay up",
+			name: "remote does not advertise ICE, peer uses relay, relay up -> partial for capability probes",
 			in: connStatusInputs{
 				peerUsesRelay:     true,
 				relayConnected:    true,
 				remoteSupportsICE: false,
 				iceWorkerCreated:  true,
 			},
-			want: guard.ConnStatusConnected,
+			want: guard.ConnStatusPartiallyConnected,
 		},
 		{
 			name: "remote does not support ICE, peer uses relay, relay down",

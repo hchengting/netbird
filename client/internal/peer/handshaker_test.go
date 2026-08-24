@@ -1,9 +1,11 @@
 package peer
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	relayClient "github.com/netbirdio/netbird/shared/relay/client"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
@@ -60,4 +62,45 @@ func TestHandshakerKeepsLatestSignalBeforeListen(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		assert.Fail(t, "remote-answer dispatch: queued signal was dropped")
 	}
+}
+
+func TestBuildOfferAnswerAdvertisesLocalICEWhenRemoteDoesNot(t *testing.T) {
+	const (
+		localUFrag = "local-ufrag"
+		localPwd   = "local-password"
+		localSID   = ICESessionID("0102030405")
+	)
+
+	h := newOfferTestHandshaker(&WorkerICE{
+		localUfrag: localUFrag,
+		localPwd:   localPwd,
+		sessionID:  localSID,
+	})
+	h.remoteICESupported.Store(false)
+
+	offer := h.buildOfferAnswer()
+	if offer.IceCredentials.UFrag != localUFrag || offer.IceCredentials.Pwd != localPwd {
+		t.Fatalf("buildOfferAnswer ICE credentials = %+v, want ufrag %q and password %q", offer.IceCredentials, localUFrag, localPwd)
+	}
+	if offer.SessionID == nil || *offer.SessionID != localSID {
+		t.Fatalf("buildOfferAnswer session ID = %v, want %s", offer.SessionID, localSID)
+	}
+}
+
+func TestBuildOfferAnswerOmitsICEWithoutLocalWorker(t *testing.T) {
+	h := newOfferTestHandshaker(nil)
+	h.remoteICESupported.Store(true)
+
+	offer := h.buildOfferAnswer()
+	if offer.hasICECredentials() {
+		t.Fatalf("buildOfferAnswer unexpectedly advertised ICE credentials: %+v", offer.IceCredentials)
+	}
+	if offer.SessionID != nil {
+		t.Fatalf("buildOfferAnswer unexpectedly advertised ICE session ID: %s", offer.SessionID)
+	}
+}
+
+func newOfferTestHandshaker(ice *WorkerICE) *Handshaker {
+	relayManager := relayClient.NewManager(context.Background(), nil, "test-peer", 1280)
+	return NewHandshaker(nil, ConnConfig{}, nil, ice, &WorkerRelay{relayManager: relayManager}, nil)
 }

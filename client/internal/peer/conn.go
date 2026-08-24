@@ -1079,10 +1079,20 @@ func evalConnStatus(in connStatusInputs) guard.ConnStatus {
 		return boolToConnStatus(relayUsedAndUp)
 	}
 
-	// Remote peer doesn't support ICE, or we haven't created the worker yet:
-	// relay is the only possible transport.
-	if !in.remoteSupportsICE || !in.iceWorkerCreated {
+	// Without a local ICE worker, relay is the only possible transport.
+	if !in.iceWorkerCreated {
 		return boolToConnStatus(relayUsedAndUp)
+	}
+
+	// A missing remote ICE advertisement can be transient after force-relay is disabled. Keep a working
+	// relay connection partially connected so the guard sends its bounded capability probes. Our offers
+	// advertise local ICE independently of this flag, allowing an unchanged remote peer to reply with its
+	// own credentials and break the relay-only capability latch.
+	if !in.remoteSupportsICE {
+		if relayUsedAndUp {
+			return guard.ConnStatusPartiallyConnected
+		}
+		return guard.ConnStatusDisconnected
 	}
 
 	// ICE counts as "up" when the status is anything other than Disconnected, OR

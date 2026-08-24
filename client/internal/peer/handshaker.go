@@ -70,7 +70,8 @@ type Handshaker struct {
 	iceListener   func(remoteOfferAnswer *OfferAnswer)
 
 	// remoteICESupported tracks whether the remote peer includes ICE credentials in its offers/answers.
-	// When false, the local side skips ICE listener dispatch and suppresses ICE credentials in responses.
+	// When false, the local side skips ICE listener dispatch. Local ICE capability is still advertised so
+	// a peer that previously observed force-relay mode can discover that ICE is available again.
 	remoteICESupported atomic.Bool
 
 	// remoteOffersCh is a channel used to wait for remote credentials to proceed with the connection
@@ -229,7 +230,10 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 		RosenpassAddr:   h.config.RosenpassConfig.Addr,
 	}
 
-	if h.ice != nil && h.RemoteICESupported() {
+	// Advertise local ICE capability independently of the last capability observed from the remote peer.
+	// Otherwise both peers can remain latched in relay-only mode after one side disables force-relay: the
+	// remote peer sends a credential-less offer first, and each side then suppresses its own credentials.
+	if h.ice != nil {
 		uFrag, pwd := h.ice.GetLocalUserCredentials()
 		sid := h.ice.SessionID()
 		answer.IceCredentials = IceCredentials{uFrag, pwd}
