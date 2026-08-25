@@ -3,92 +3,64 @@ package net
 import (
 	"context"
 	"errors"
-	"fmt"
 	stdnet "net"
 	"net/netip"
-	"time"
 )
 
-const (
-	cloudflareDNSIPv4Address  = "1.1.1.1:53"
-	cloudflareDNSIPv6Address  = "[2606:4700:4700::1111]:53"
-	googleDNSIPv4Address      = "8.8.8.8:53"
-	googleDNSIPv6Address      = "[2001:4860:4860::8888]:53"
-	controlPlaneLookupTimeout = 5 * time.Second
-)
+const errNoSuitableAddress = "no suitable address found"
 
-type resolverAttempt struct {
-	name     string
-	resolver hostResolver
+type controlPlaneLookupFunc func(host string) ([]netip.Addr, error)
+
+type callbackResolver struct {
+	lookup controlPlaneLookupFunc
 }
 
-type fallbackResolver struct {
-	attempts []resolverAttempt
-	timeout  time.Duration
-}
-
-type lookupAttemptResult struct {
-	name      string
+type callbackLookupResult struct {
 	addresses []netip.Addr
 	err       error
 }
 
-func newPublicFallbackResolver(dialer contextDialer) hostResolver {
-	return &fallbackResolver{
-		attempts: []resolverAttempt{
-			{name: "Cloudflare IPv4", resolver: newFixedDNSResolver(dialer, cloudflareDNSIPv4Address)},
-			{name: "Cloudflare IPv6", resolver: newFixedDNSResolver(dialer, cloudflareDNSIPv6Address)},
-			{name: "Google IPv4", resolver: newFixedDNSResolver(dialer, googleDNSIPv4Address)},
-			{name: "Google IPv6", resolver: newFixedDNSResolver(dialer, googleDNSIPv6Address)},
-		},
-		timeout: controlPlaneLookupTimeout,
-	}
+func newCallbackControlPlaneResolver(lookup controlPlaneLookupFunc) hostResolver {
+	return &callbackResolver{lookup: lookup}
 }
 
-func newFixedDNSResolver(dialer contextDialer, address string) *stdnet.Resolver {
-	return &stdnet.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (stdnet.Conn, error) {
-			return dialer.DialContext(ctx, network, address)
-		},
+// LookupNetIP adapts a platform hostname lookup callback to hostResolver. The
+// callback itself may not support cancellation (Android Network.getAllByName
+// does not), so it runs outside the caller goroutine and the result channel is
+// buffered to let a late result exit after the context has been cancelled.
+func (r *callbackResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	if r.lookup == nil {
+		return nil, errors.New("control-plane DNS resolver callback is not configured")
 	}
-}
-
-func (r *fallbackResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
-	if len(r.attempts) == 0 {
-		return nil, errors.New("no control-plane DNS resolvers configured")
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	lookupCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
+	resultCh := make(chan callbackLookupResult, 1)
+	go func() {
+		addresses, err := r.lookup(host)
+		resultCh <- callbackLookupResult{addresses: addresses, err: err}
+	}()
 
-	results := make(chan lookupAttemptResult, len(r.attempts))
-	for _, attempt := range r.attempts {
-		go func() {
-			addresses, err := attempt.resolver.LookupNetIP(lookupCtx, network, host)
-			results <- lookupAttemptResult{name: attempt.name, addresses: addresses, err: err}
-		}()
+	var result callbackLookupResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if result.err != nil {
+		return nil, result.err
+	}
+	if len(result.addresses) == 0 {
+		return nil, errors.New("platform resolver returned no control-plane addresses")
 	}
 
-	lookupErrors := make([]error, 0, len(r.attempts)+1)
-	for range r.attempts {
-		select {
-		case result := <-results:
-			if result.err == nil && len(result.addresses) > 0 {
-				return result.addresses, nil
-			}
-			if result.err == nil {
-				result.err = errors.New("no usable addresses")
-			}
-			lookupErrors = append(lookupErrors, fmt.Errorf("%s DNS resolver: %w", result.name, result.err))
-		case <-lookupCtx.Done():
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			lookupErrors = append(lookupErrors, fmt.Errorf("control-plane DNS lookup: %w", lookupCtx.Err()))
-			return nil, errors.Join(lookupErrors...)
-		}
+	addresses := filterAddresses(network, result.addresses)
+	if len(addresses) == 0 {
+		// Match net.Resolver's wrong-family behavior. The management DNS cache
+		// recognizes this value as NODATA instead of turning a valid hostname
+		// with only A or only AAAA records into SERVFAIL/NXDOMAIN.
+		return nil, &stdnet.AddrError{Err: errNoSuitableAddress, Addr: host}
 	}
-
-	return nil, errors.Join(lookupErrors...)
+	return addresses, nil
 }

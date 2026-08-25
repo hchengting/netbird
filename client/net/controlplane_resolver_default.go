@@ -2,6 +2,6 @@
 
 package net
 
-func newPlatformControlPlaneResolver(contextDialer) hostResolver {
+func newPlatformControlPlaneResolver() hostResolver {
 	return nil
 }

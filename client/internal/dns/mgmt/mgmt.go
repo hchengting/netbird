@@ -437,30 +437,33 @@ func (m *Resolver) osLookup(ctx context.Context, d domain.Domain, dnsName string
 	return m.hostLookup(ctx, net.DefaultResolver, d, dnsName, qtype)
 }
 
-type familyLookupResult struct {
-	qtype   uint16
-	records []dns.RR
-	err     error
-}
+// lookupBothViaHost performs one all-family lookup and partitions its result,
+// avoiding duplicate Android getAllByName calls for the same hostname.
+func (m *Resolver) lookupBothViaHost(ctx context.Context, resolver hostResolver, d domain.Domain, dnsName string) ([]dns.RR, []dns.RR, error, error) {
+	log.Infof("looking up IP for mgmt domain=%s type=A/AAAA", d.SafeString())
+	defer log.Infof("done looking up IP for mgmt domain=%s type=A/AAAA", d.SafeString())
 
-func (m *Resolver) lookupBothViaHost(ctx context.Context, resolver hostResolver, d domain.Domain, dnsName string) (aRecords, aaaaRecords []dns.RR, errA, errAAAA error) {
-	results := make(chan familyLookupResult, 2)
-	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
-		go func() {
-			records, err := m.hostLookup(ctx, resolver, d, dnsName, qtype)
-			results <- familyLookupResult{qtype: qtype, records: records, err: err}
-		}()
+	addresses, err := resolver.LookupNetIP(ctx, "ip", d.PunycodeString())
+	if err != nil {
+		err = fmt.Errorf("resolve %s type=A/AAAA: %w", d.SafeString(), err)
+		return nil, nil, err, err
 	}
 
-	for range 2 {
-		result := <-results
-		if result.qtype == dns.TypeA {
-			aRecords, errA = result.records, result.err
+	var ipv4, ipv6 []netip.Addr
+	for _, address := range addresses {
+		if !address.IsValid() {
+			continue
+		}
+		address = address.Unmap()
+		if address.Is4() {
+			ipv4 = append(ipv4, address)
 		} else {
-			aaaaRecords, errAAAA = result.records, result.err
+			ipv6 = append(ipv6, address)
 		}
 	}
-	return
+
+	ttl := uint32(m.cacheTTL.Seconds())
+	return resutil.IPsToRRs(dnsName, ipv4, ttl), resutil.IPsToRRs(dnsName, ipv6, ttl), nil, nil
 }
 
 func (m *Resolver) hostLookup(ctx context.Context, resolver hostResolver, d domain.Domain, dnsName string, qtype uint16) ([]dns.RR, error) {

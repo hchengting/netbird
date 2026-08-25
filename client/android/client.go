@@ -5,6 +5,7 @@ package android
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -54,6 +55,12 @@ type IFaceDiscover interface {
 // NetworkChangeListener export internal NetworkChangeListener for mobile
 type NetworkChangeListener interface {
 	listener.NetworkChangeListener
+}
+
+// ControlPlaneResolver resolves hostnames using Android's selected non-VPN
+// Network. It is intentionally separate from the VPN DNS handler chain.
+type ControlPlaneResolver interface {
+	ResolveHost(host string) (*IPList, error)
 }
 
 // DnsReadyListener export internal dns ReadyListener for mobile
@@ -144,10 +151,23 @@ func (c *Client) getConnectClient() *internal.ConnectClient {
 }
 
 // NewClient instantiate a new Client
-func NewClient(androidSDKVersion int, deviceName string, uiVersion string, tunAdapter TunAdapter, iFaceDiscover IFaceDiscover, networkChangeListener NetworkChangeListener) *Client {
+func NewClient(androidSDKVersion int, deviceName string, uiVersion string, tunAdapter TunAdapter, iFaceDiscover IFaceDiscover, networkChangeListener NetworkChangeListener, controlPlaneResolver ControlPlaneResolver) *Client {
 	execWorkaround(androidSDKVersion)
 
 	net.SetAndroidProtectSocketFn(tunAdapter.ProtectSocket)
+	net.SetAndroidControlPlaneResolverFn(func(host string) ([]netip.Addr, error) {
+		if controlPlaneResolver == nil {
+			return nil, fmt.Errorf("Android control-plane DNS resolver is not configured")
+		}
+		addresses, err := controlPlaneResolver.ResolveHost(host)
+		if err != nil {
+			return nil, err
+		}
+		if addresses == nil {
+			return nil, fmt.Errorf("Android control-plane DNS resolver returned no result")
+		}
+		return slices.Clone(addresses.items), nil
+	})
 	system.SetIFaceDiscover(iFaceDiscover)
 	recorder := peer.NewRecorder("")
 	return &Client{

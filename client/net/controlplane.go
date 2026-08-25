@@ -22,7 +22,7 @@ type contextDialer interface {
 }
 
 // ControlPlaneDialer resolves and dials control-plane endpoints. On Android it
-// uses dedicated public DNS resolvers without changing the VPN DNS settings.
+// uses the selected underlying Network without changing the VPN DNS settings.
 type ControlPlaneDialer struct {
 	dialer        contextDialer
 	resolver      hostResolver
@@ -32,8 +32,7 @@ type ControlPlaneDialer struct {
 // NewControlPlaneDialer creates a dialer for management, signal, and relay
 // endpoints. Platforms other than Android retain the default resolver path.
 func NewControlPlaneDialer() *ControlPlaneDialer {
-	dialer := NewDialer()
-	return newControlPlaneDialer(dialer, newPlatformControlPlaneResolver(dialer))
+	return newControlPlaneDialer(NewDialer(), newPlatformControlPlaneResolver())
 }
 
 func newControlPlaneDialer(dialer contextDialer, resolver hostResolver) *ControlPlaneDialer {
@@ -89,7 +88,7 @@ func (d *ControlPlaneDialer) DialContext(ctx context.Context, network, address s
 		return nil, fmt.Errorf("split control-plane address: %w", err)
 	}
 
-	addresses, err := d.resolveHost(ctx, network, host)
+	addresses, err := d.LookupNetIP(ctx, network, host)
 	if err != nil {
 		return nil, err
 	}
@@ -114,25 +113,13 @@ func (d *ControlPlaneDialer) ResolveUDPAddr(ctx context.Context, network, addres
 		return nil, fmt.Errorf("parse control-plane UDP port: %w", err)
 	}
 
-	addresses, err := d.resolveHost(ctx, network, host)
+	addresses, err := d.LookupNetIP(ctx, network, host)
 	if err != nil {
 		return nil, err
-	}
-	if len(addresses) == 0 {
-		return nil, fmt.Errorf("resolve control-plane UDP address: no usable addresses")
 	}
 
 	addrPort := netip.AddrPortFrom(addresses[0], uint16(port))
 	return stdnet.UDPAddrFromAddrPort(addrPort), nil
-}
-
-func (d *ControlPlaneDialer) resolveHost(ctx context.Context, network, host string) ([]netip.Addr, error) {
-	lookupNetwork, err := lookupNetworkForDial(network)
-	if err != nil {
-		return nil, err
-	}
-
-	return d.LookupNetIP(ctx, lookupNetwork, host)
 }
 
 func (d *ControlPlaneDialer) dialResolved(ctx context.Context, network, port string, addresses []netip.Addr) (stdnet.Conn, error) {

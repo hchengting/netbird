@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	dnsconfig "github.com/netbirdio/netbird/client/internal/dns/config"
+	"github.com/netbirdio/netbird/client/internal/dns/test"
 	"github.com/netbirdio/netbird/shared/management/domain"
 )
 
@@ -31,15 +32,14 @@ func TestResolver_ControlPlaneDomainsUseDedicatedResolver(t *testing.T) {
 		resolverMu.Lock()
 		resolverCalls[host+"|"+network]++
 		resolverMu.Unlock()
-		switch network {
-		case "ip4":
-			return []netip.Addr{netip.MustParseAddr("192.0.2.80")}, nil
-		case "ip6":
-			return []netip.Addr{netip.MustParseAddr("2001:db8::80")}, nil
-		default:
+		if network != "ip" {
 			t.Fatalf("LookupNetIP() network = %q", network)
 			return nil, nil
 		}
+		return []netip.Addr{
+			netip.MustParseAddr("192.0.2.80"),
+			netip.MustParseAddr("2001:db8::80"),
+		}, nil
 	})
 	r := newResolver(controlResolver)
 	chain := newFakeChain()
@@ -67,13 +67,23 @@ func TestResolver_ControlPlaneDomainsUseDedicatedResolver(t *testing.T) {
 	}
 
 	for _, host := range []string{"management.example.com", "signal.example.com", "relay.example.com"} {
-		assert.Equal(t, 1, resolverCallCount(host+"|ip4"))
-		assert.Equal(t, 1, resolverCallCount(host+"|ip6"))
+		assert.Equal(t, 1, resolverCallCount(host+"|ip"))
 		assert.Equal(t, 0, chain.callCount(host+".", dns.TypeA))
 		assert.Equal(t, "192.0.2.80", firstA(t, queryA(t, r, host+".")))
+
+		msg := new(dns.Msg)
+		msg.SetQuestion(host+".", dns.TypeAAAA)
+		writer := &test.MockResponseWriter{}
+		r.ServeDNS(writer, msg)
+		response := writer.GetLastResponse()
+		require.NotNil(t, response)
+		require.Len(t, response.Answer, 1)
+		aaaa, ok := response.Answer[0].(*dns.AAAA)
+		require.True(t, ok)
+		assert.Equal(t, "2001:db8::80", aaaa.AAAA.String())
 	}
 
-	assert.Equal(t, 0, resolverCallCount("stun.example.com|ip4"))
+	assert.Equal(t, 0, resolverCallCount("stun.example.com|ip"))
 	assert.Equal(t, 1, chain.callCount("stun.example.com.", dns.TypeA))
 	assert.Equal(t, "10.0.0.2", firstA(t, queryA(t, r, "stun.example.com.")))
 }
