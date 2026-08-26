@@ -117,6 +117,10 @@ type Client struct {
 
 	extendMu     sync.Mutex
 	extendCancel context.CancelFunc
+
+	forceRelayMu         sync.Mutex
+	forceRelay           bool
+	forceRelayGeneration uint64
 }
 
 func (c *Client) setState(cfg *profilemanager.Config, cacheDir string, cfgPath string, cc *internal.ConnectClient) {
@@ -184,7 +188,9 @@ func NewClient(androidSDKVersion int, deviceName string, uiVersion string, tunAd
 
 // Run start the internal client. It is a blocker function
 func (c *Client) Run(platformFiles PlatformFiles, urlOpener URLOpener, isAndroidTV bool, dns *DNSList, dnsReadyListener DnsReadyListener, envList *EnvList) error {
+	forceRelayGeneration := c.forceRelayGenerationSnapshot()
 	exportEnvList(envList)
+	c.seedForceRelayFromEnvironment(forceRelayGeneration)
 
 	cfgFile := platformFiles.ConfigurationFilePath()
 	stateFile := platformFiles.StateFilePath()
@@ -221,8 +227,11 @@ func (c *Client) Run(platformFiles PlatformFiles, urlOpener URLOpener, isAndroid
 	ctx = internal.CtxInitState(ctx)
 
 	connectClient := internal.NewConnectClient(ctx, cfg, c.recorder,
-		internal.WithNetEvents(c.netMgr))
+		internal.WithNetEvents(c.netMgr), internal.WithForceRelay(c.desiredForceRelay()))
 	c.setState(cfg, cacheDir, cfgFile, connectClient)
+	if err := connectClient.SetForceRelay(c.desiredForceRelay()); err != nil {
+		return err
+	}
 	// This path runs the interactive SSO flow, so reaching here means the peer
 	// is authenticated again — release the latch Status() reports from. Clear
 	// only once the fresh connect client is installed: until then Status()
@@ -235,7 +244,9 @@ func (c *Client) Run(platformFiles PlatformFiles, urlOpener URLOpener, isAndroid
 // RunWithoutLogin we apply this type of run function when the backed has been started without UI (i.e. after reboot).
 // In this case make no sense handle registration steps.
 func (c *Client) RunWithoutLogin(platformFiles PlatformFiles, dns *DNSList, dnsReadyListener DnsReadyListener, envList *EnvList) error {
+	forceRelayGeneration := c.forceRelayGenerationSnapshot()
 	exportEnvList(envList)
+	c.seedForceRelayFromEnvironment(forceRelayGeneration)
 
 	cfgFile := platformFiles.ConfigurationFilePath()
 	stateFile := platformFiles.StateFilePath()
@@ -263,8 +274,11 @@ func (c *Client) RunWithoutLogin(platformFiles PlatformFiles, dns *DNSList, dnsR
 	// todo do not throw error in case of cancelled context
 	ctx = internal.CtxInitState(ctx)
 	connectClient := internal.NewConnectClient(ctx, cfg, c.recorder,
-		internal.WithNetEvents(c.netMgr))
+		internal.WithNetEvents(c.netMgr), internal.WithForceRelay(c.desiredForceRelay()))
 	c.setState(cfg, cacheDir, cfgFile, connectClient)
+	if err := connectClient.SetForceRelay(c.desiredForceRelay()); err != nil {
+		return err
+	}
 	return connectClient.RunOnAndroid(c.tunAdapter, c.iFaceDiscover, c.networkChangeListener, slices.Clone(dns.items), dnsReadyListener, stateFile, cacheDir)
 }
 
@@ -277,6 +291,44 @@ func (c *Client) Stop() {
 	}
 
 	c.ctxCancel()
+}
+
+// SetForceRelay updates the desired client policy. The ConnectClient queues it
+// when login or engine initialization is still in progress.
+func (c *Client) SetForceRelay(enabled bool) error {
+	c.forceRelayMu.Lock()
+	c.forceRelay = enabled
+	c.forceRelayGeneration++
+	c.forceRelayMu.Unlock()
+
+	cc := c.getConnectClient()
+	if cc == nil {
+		return nil
+	}
+	return cc.SetForceRelay(enabled)
+}
+
+func (c *Client) forceRelayGenerationSnapshot() uint64 {
+	c.forceRelayMu.Lock()
+	defer c.forceRelayMu.Unlock()
+	return c.forceRelayGeneration
+}
+
+func (c *Client) seedForceRelayFromEnvironment(generation uint64) {
+	c.forceRelayMu.Lock()
+	defer c.forceRelayMu.Unlock()
+	// A runtime setter can win before Run enters Go; its newer desired value
+	// must not be replaced by the environment captured by the Java run thread.
+	if generation != 0 || c.forceRelayGeneration != generation {
+		return
+	}
+	c.forceRelay = peer.IsForceRelayed()
+}
+
+func (c *Client) desiredForceRelay() bool {
+	c.forceRelayMu.Lock()
+	defer c.forceRelayMu.Unlock()
+	return c.forceRelay
 }
 
 func (c *Client) RenewTun(fd int) error {

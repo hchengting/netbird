@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -158,6 +159,10 @@ type EngineConfig struct {
 	// the env var and management feature flag.
 	LazyConnection lazyconn.State
 
+	// ForceRelay is the initial transport policy. Runtime changes are kept on
+	// Engine and propagated to existing peer connections.
+	ForceRelay bool
+
 	MTU uint16
 
 	// for debug bundle generation
@@ -261,6 +266,7 @@ type Engine struct {
 	stateManager       *statemanager.Manager
 	portForwardManager *portforward.Manager
 	srWatcher          *guard.SRWatcher
+	forceRelay         atomic.Bool
 
 	afpacketCapture *capture.AFPacketCapture
 
@@ -360,6 +366,12 @@ func NewEngine(
 		updateManager:      services.UpdateManager,
 		syncStoreDir:       config.StateDir,
 	}
+	forceRelay := config.ForceRelay
+	if runtime.GOOS == "js" {
+		forceRelay = true
+	}
+	engine.forceRelay.Store(forceRelay)
+	engine.config.ForceRelay = forceRelay
 	// sessionWatcher keeps the SubscribeStatus consumers in sync with the
 	// session expiry deadline. Deadline-change ticks come for free via
 	// Status.SetSessionExpiresAt; the watcher exists to push a wake-up at
@@ -401,6 +413,53 @@ func (e *Engine) Stop() error {
 	log.Infof("stopped Netbird Engine")
 
 	return nil
+}
+
+// SetForceRelay updates the engine transport policy without restarting the
+// engine. Existing open peers recycle only their connection transports; closed
+// lazy peers keep their idle state and use the new policy when activated.
+func (e *Engine) SetForceRelay(enabled bool) error {
+	if runtime.GOOS == "js" && !enabled {
+		return errors.New("force relay cannot be disabled on js")
+	}
+
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+
+	if err := e.ctx.Err(); err != nil {
+		return fmt.Errorf("engine is stopped: %w", err)
+	}
+	e.forceRelay.Store(enabled)
+	if e.srWatcher != nil {
+		e.srWatcher.SetICEMonitorEnabled(!enabled)
+	}
+
+	var merr *multierror.Error
+	restarted := 0
+	if e.peerStore != nil {
+		for _, peerKey := range e.peerStore.PeersPubKey() {
+			conn, ok := e.peerStore.PeerConn(peerKey)
+			if !ok {
+				continue
+			}
+			peerRestarted, err := conn.ReconfigureForceRelay(e.ctx, enabled)
+			if err != nil {
+				merr = multierror.Append(merr, fmt.Errorf("reconfigure peer %s: %w", peerKey, err))
+				continue
+			}
+			if peerRestarted {
+				restarted++
+			}
+		}
+	}
+
+	log.Infof("force-relay runtime policy updated to %t; recycled %d open peer transports", enabled, restarted)
+	return nberrors.FormatErrorOrNil(merr)
+}
+
+// ForceRelayEnabled reports the engine-owned transport policy.
+func (e *Engine) ForceRelayEnabled() bool {
+	return e.forceRelay.Load()
 }
 
 // stopLocked tears down everything Start may have brought up, in the order
@@ -685,7 +744,7 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	})
 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
-	e.srWatcher.Start(peer.IsForceRelayed())
+	e.srWatcher.Start(e.forceRelay.Load())
 
 	if err = e.receiveSignalEvents(); err != nil {
 		return err
@@ -1904,8 +1963,9 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 			Addr:           e.getRosenpassAddr(),
 			PermissiveMode: e.config.RosenpassPermissive,
 		},
-		ICEConfig: e.createICEConfig(),
-		NetMgr:    e.netMgr,
+		ICEConfig:  e.createICEConfig(),
+		NetMgr:     e.netMgr,
+		ForceRelay: e.forceRelay.Load(),
 	}
 
 	serviceDependencies := peer.ServiceDependencies{

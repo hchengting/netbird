@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -15,6 +16,10 @@ type chNotifier interface {
 	Ready() bool
 }
 
+type iceMonitor interface {
+	Start(context.Context, func())
+}
+
 type SRWatcher struct {
 	signalClient chNotifier
 	relayManager chNotifier
@@ -23,7 +28,10 @@ type SRWatcher struct {
 	mu               sync.Mutex
 	iFaceDiscover    stdnet.ExternalIFaceDiscover
 	iceConfig        ice.Config
+	started          bool
 	cancelIceMonitor context.CancelFunc
+	iceMonitorRun    uint64
+	newICEMonitor    func(stdnet.ExternalIFaceDiscover, ice.Config, time.Duration) iceMonitor
 }
 
 // NewSRWatcher creates a new SRWatcher. This watcher will notify the listeners when the ICE candidates change or the
@@ -35,6 +43,9 @@ func NewSRWatcher(signalClient chNotifier, relayManager chNotifier, iFaceDiscove
 		iFaceDiscover: iFaceDiscover,
 		iceConfig:     iceConfig,
 		listeners:     make(map[chan struct{}]struct{}),
+		newICEMonitor: func(discover stdnet.ExternalIFaceDiscover, config ice.Config, period time.Duration) iceMonitor {
+			return NewICEMonitor(discover, config, period)
+		},
 	}
 	return srw
 }
@@ -43,32 +54,68 @@ func (w *SRWatcher) Start(disableICEMonitor bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.cancelIceMonitor != nil {
+	if w.started {
 		return
 	}
+	w.started = true
 
-	ctx, cancel := context.WithCancel(context.Background())
-	w.cancelIceMonitor = cancel
-
-	if !disableICEMonitor {
-		iceMonitor := NewICEMonitor(w.iFaceDiscover, w.iceConfig, GetICEMonitorPeriod())
-		go iceMonitor.Start(ctx, w.onICEChanged)
-	}
 	w.signalClient.SetOnReconnectedListener(w.onReconnected)
 	w.relayManager.SetOnReconnectedListener(w.onReconnected)
 
+	if !disableICEMonitor {
+		w.startICEMonitorLocked()
+	}
+}
+
+// SetICEMonitorEnabled changes only ICE candidate monitoring. Signal and relay
+// reconnect callbacks remain registered for the lifetime of the watcher.
+func (w *SRWatcher) SetICEMonitorEnabled(enabled bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.started {
+		return
+	}
+	if enabled {
+		w.startICEMonitorLocked()
+		return
+	}
+	w.stopICEMonitorLocked()
 }
 
 func (w *SRWatcher) Close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if !w.started {
+		return
+	}
+	w.started = false
+	w.stopICEMonitorLocked()
+	w.signalClient.SetOnReconnectedListener(nil)
+	w.relayManager.SetOnReconnectedListener(nil)
+}
+
+func (w *SRWatcher) startICEMonitorLocked() {
+	if w.cancelIceMonitor != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.cancelIceMonitor = cancel
+	w.iceMonitorRun++
+	run := w.iceMonitorRun
+	iceMonitor := w.newICEMonitor(w.iFaceDiscover, w.iceConfig, GetICEMonitorPeriod())
+	go iceMonitor.Start(ctx, func() { w.onICEChanged(run) })
+}
+
+func (w *SRWatcher) stopICEMonitorLocked() {
 	if w.cancelIceMonitor == nil {
 		return
 	}
+	w.iceMonitorRun++
 	w.cancelIceMonitor()
-	w.signalClient.SetOnReconnectedListener(nil)
-	w.relayManager.SetOnReconnectedListener(nil)
+	w.cancelIceMonitor = nil
 }
 
 func (w *SRWatcher) NewListener() chan struct{} {
@@ -87,13 +134,19 @@ func (w *SRWatcher) RemoveListener(listenerChan chan struct{}) {
 	close(listenerChan)
 }
 
-func (w *SRWatcher) onICEChanged() {
+func (w *SRWatcher) onICEChanged(run uint64) {
 	if !w.signalClient.Ready() {
 		return
 	}
 
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.started || w.cancelIceMonitor == nil || w.iceMonitorRun != run {
+		return
+	}
+
 	log.Infof("network changes detected by ICE agent")
-	w.notify()
+	w.notifyLocked()
 }
 
 func (w *SRWatcher) onReconnected() {
@@ -111,6 +164,10 @@ func (w *SRWatcher) onReconnected() {
 func (w *SRWatcher) notify() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.notifyLocked()
+}
+
+func (w *SRWatcher) notifyLocked() {
 	for listener := range w.listeners {
 		select {
 		case listener <- struct{}{}:

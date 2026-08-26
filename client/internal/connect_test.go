@@ -1,9 +1,31 @@
 package internal
 
 import (
+	"context"
 	"net"
 	"testing"
 )
+
+func TestConnectClientQueuesForceRelayWithoutRunningEngine(t *testing.T) {
+	client := NewConnectClient(context.Background(), nil, nil)
+
+	if err := client.SetForceRelay(true); err != nil {
+		t.Fatalf("queue force relay before engine initialization: %v", err)
+	}
+	if !client.forceRelay.Load() {
+		t.Fatal("queued force relay setting should be enabled")
+	}
+
+	if err := client.Stop(); err != nil {
+		t.Fatalf("stop client: %v", err)
+	}
+	if err := client.SetForceRelay(false); err != nil {
+		t.Fatalf("queue force relay after client stop: %v", err)
+	}
+	if client.forceRelay.Load() {
+		t.Fatal("queued force relay setting should be disabled")
+	}
+}
 
 func Test_freePort(t *testing.T) {
 	tests := []struct {
