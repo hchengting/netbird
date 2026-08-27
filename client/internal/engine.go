@@ -416,8 +416,8 @@ func (e *Engine) Stop() error {
 }
 
 // SetForceRelay updates the engine transport policy without restarting the
-// engine. Existing open peers recycle only their connection transports; closed
-// lazy peers keep their idle state and use the new policy when activated.
+// engine. Existing open peers preserve an available path while switching when
+// possible; closed lazy peers use the new policy when activated.
 func (e *Engine) SetForceRelay(enabled bool) error {
 	if runtime.GOOS == "js" && !enabled {
 		return errors.New("force relay cannot be disabled on js")
@@ -435,25 +435,25 @@ func (e *Engine) SetForceRelay(enabled bool) error {
 	}
 
 	var merr *multierror.Error
-	restarted := 0
+	reconfigured := 0
 	if e.peerStore != nil {
 		for _, peerKey := range e.peerStore.PeersPubKey() {
 			conn, ok := e.peerStore.PeerConn(peerKey)
 			if !ok {
 				continue
 			}
-			peerRestarted, err := conn.ReconfigureForceRelay(e.ctx, enabled)
+			peerReconfigured, err := conn.ReconfigureForceRelay(e.ctx, enabled)
 			if err != nil {
 				merr = multierror.Append(merr, fmt.Errorf("reconfigure peer %s: %w", peerKey, err))
 				continue
 			}
-			if peerRestarted {
-				restarted++
+			if peerReconfigured {
+				reconfigured++
 			}
 		}
 	}
 
-	log.Infof("force-relay runtime policy updated to %t; recycled %d open peer transports", enabled, restarted)
+	log.Infof("force-relay runtime policy updated to %t; reconfigured %d open peers", enabled, reconfigured)
 	return nberrors.FormatErrorOrNil(merr)
 }
 

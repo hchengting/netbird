@@ -110,7 +110,21 @@ func (h *Handshaker) AddRelayListener(offer func(remoteOfferAnswer *OfferAnswer)
 }
 
 func (h *Handshaker) AddICEListener(offer func(remoteOfferAnswer *OfferAnswer)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.iceListener = offer
+}
+
+func (h *Handshaker) setICEWorker(workerICE *WorkerICE) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.ice = workerICE
+	if workerICE == nil {
+		h.iceListener = nil
+		return
+	}
+	h.iceListener = workerICE.OnNewOffer
 }
 
 func (h *Handshaker) Listen(ctx context.Context) {
@@ -130,9 +144,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 				h.relayListener.Notify(&remoteOfferAnswer)
 			}
 
-			if h.iceListener != nil && h.RemoteICESupported() {
-				h.iceListener(&remoteOfferAnswer)
-			}
+			h.notifyICEListener(&remoteOfferAnswer)
 
 			if err := h.sendAnswer(); err != nil {
 				h.log.Errorf("failed to send remote offer confirmation: %s", err)
@@ -152,9 +164,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 				h.relayListener.Notify(&remoteOfferAnswer)
 			}
 
-			if h.iceListener != nil && h.RemoteICESupported() {
-				h.iceListener(&remoteOfferAnswer)
-			}
+			h.notifyICEListener(&remoteOfferAnswer)
 		case <-ctx.Done():
 			h.log.Infof("stop listening for remote offers and answers")
 			return
@@ -209,20 +219,29 @@ func (h *Handshaker) sendOffer() error {
 		return ErrSignalIsNotReady
 	}
 
-	offer := h.buildOfferAnswer()
+	offer := h.buildOfferAnswerLocked()
 	h.log.Debugf("sending offer with serial: %s", offer.SessionIDString())
 
 	return h.signaler.SignalOffer(offer, h.config.Key)
 }
 
 func (h *Handshaker) sendAnswer() error {
-	answer := h.buildOfferAnswer()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	answer := h.buildOfferAnswerLocked()
 	h.log.Debugf("sending answer with serial: %s", answer.SessionIDString())
 
 	return h.signaler.SignalAnswer(answer, h.config.Key)
 }
 
 func (h *Handshaker) buildOfferAnswer() OfferAnswer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.buildOfferAnswerLocked()
+}
+
+func (h *Handshaker) buildOfferAnswerLocked() OfferAnswer {
 	answer := OfferAnswer{
 		WgListenPort:    h.config.LocalWgPort,
 		Version:         version.NetbirdVersion(),
@@ -249,16 +268,34 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 }
 
 func (h *Handshaker) updateRemoteICEState(offer *OfferAnswer) {
+	h.mu.Lock()
 	hasICE := offer.hasICECredentials()
 	prev := h.remoteICESupported.Swap(hasICE)
+	var workerICE *WorkerICE
 	if prev != hasICE {
 		if hasICE {
 			h.log.Infof("remote peer started sending ICE credentials")
 		} else {
 			h.log.Infof("remote peer stopped sending ICE credentials")
-			if h.ice != nil {
-				h.ice.Close()
-			}
+			workerICE = h.ice
 		}
+	}
+	h.mu.Unlock()
+
+	if workerICE != nil {
+		workerICE.Close()
+	}
+}
+
+func (h *Handshaker) notifyICEListener(offer *OfferAnswer) {
+	h.mu.Lock()
+	var listener func(*OfferAnswer)
+	if h.iceListener != nil && h.RemoteICESupported() {
+		listener = h.iceListener
+	}
+	h.mu.Unlock()
+
+	if listener != nil {
+		listener(offer)
 	}
 }

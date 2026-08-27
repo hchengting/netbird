@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +98,48 @@ func TestBuildOfferAnswerOmitsICEWithoutLocalWorker(t *testing.T) {
 	}
 	if offer.SessionID != nil {
 		t.Fatalf("buildOfferAnswer unexpectedly advertised ICE session ID: %s", offer.SessionID)
+	}
+}
+
+func TestHandshakerSetICEWorkerSerializesOfferConstruction(t *testing.T) {
+	workerICE := &WorkerICE{
+		localUfrag: "local-ufrag",
+		localPwd:   "local-password",
+		sessionID:  ICESessionID("0102030405"),
+	}
+	h := newOfferTestHandshaker(nil)
+
+	const iterations = 1000
+	start := make(chan struct{})
+	invalidOffer := make(chan OfferAnswer, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			h.setICEWorker(workerICE)
+			h.setICEWorker(nil)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			offer := h.buildOfferAnswer()
+			if offer.hasICECredentials() != (offer.SessionID != nil) {
+				invalidOffer <- offer
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	select {
+	case offer := <-invalidOffer:
+		t.Fatalf("offer observed a partial ICE update: %+v", offer)
+	default:
 	}
 }
 

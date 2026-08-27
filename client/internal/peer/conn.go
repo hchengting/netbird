@@ -139,8 +139,11 @@ type Conn struct {
 	workerICE   *WorkerICE
 	workerRelay *WorkerRelay
 	forceRelay  atomic.Bool
+	// workerICESnapshot lets the guard inspect the optional worker without
+	// taking mu while Close waits for the guard to stop.
+	workerICESnapshot atomic.Pointer[WorkerICE]
 	// immediateEndpointUpdates is a one-shot mask for the first relay and ICE
-	// endpoint configurations in a runtime policy replacement. Guarded by mu.
+	// endpoint configurations in a runtime policy transition. Guarded by mu.
 	immediateEndpointUpdates immediateEndpointUpdate
 
 	wgWatcher       *WGWatcher
@@ -295,6 +298,7 @@ func (conn *Conn) open(
 	conn.metricsStages = metricsStages
 	conn.workerRelay = workerRelay
 	conn.workerICE = workerICE
+	conn.workerICESnapshot.Store(workerICE)
 	conn.handshaker = handshaker
 	conn.guard = connectionGuard
 	conn.immediateEndpointUpdates = immediateUpdates
@@ -395,15 +399,16 @@ func (conn *Conn) close(signalToRemote bool) {
 	conn.ctxCancel = nil
 	conn.workerRelay = nil
 	conn.workerICE = nil
+	conn.workerICESnapshot.Store(nil)
 	conn.handshaker = nil
 	conn.guard = nil
 	conn.immediateEndpointUpdates = 0
 	conn.Log.Infof("peer connection closed")
 }
 
-// ReconfigureForceRelay stores the new mode and recycles transports only when
-// this peer is open. Closed lazy peers remain idle and use the new mode on the
-// next activation.
+// ReconfigureForceRelay applies a transport policy change to an open peer while
+// preserving an available relay or ICE path. Closed lazy peers remain idle and
+// use the new mode on the next activation.
 func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool) (bool, error) {
 	conn.lifecycleMu.Lock()
 	defer conn.lifecycleMu.Unlock()
@@ -413,14 +418,37 @@ func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool)
 		return false, nil
 	}
 
-	conn.forceRelay.Store(enabled)
 	conn.mu.Lock()
 	opened := conn.opened
-	conn.mu.Unlock()
 	if !opened {
+		conn.forceRelay.Store(enabled)
+		conn.mu.Unlock()
 		return false, nil
 	}
 
+	if !enabled {
+		handshaker, err := conn.enableICELocked()
+		conn.mu.Unlock()
+		if err != nil {
+			return true, err
+		}
+		conn.signalForceRelayUpdate(handshaker)
+		return true, nil
+	}
+
+	retiredICE, applied, err := conn.enableForceRelayLocked()
+	handshaker := conn.handshaker
+	conn.mu.Unlock()
+	if err != nil {
+		return true, err
+	}
+	if applied {
+		conn.signalForceRelayUpdate(handshaker)
+		retiredICE.close(conn.Log)
+		return true, nil
+	}
+
+	conn.forceRelay.Store(enabled)
 	conn.close(false)
 	if err := conn.open(engineCtx, nil, runtimeImmediateEndpointUpdates(enabled)); err != nil {
 		conn.forceRelay.Store(previous)
@@ -433,6 +461,117 @@ func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool)
 		return true, fmt.Errorf("apply force-relay policy (previous policy restored): %w", err)
 	}
 	return true, nil
+}
+
+type retiredICETransport struct {
+	worker *WorkerICE
+	proxy  wgproxy.Proxy
+}
+
+func (r retiredICETransport) close(log *log.Entry) {
+	if r.worker != nil {
+		r.worker.Close()
+	}
+	if r.proxy != nil {
+		if err := r.proxy.CloseConn(); err != nil {
+			log.Warnf("failed to close retired ICE proxy: %v", err)
+		}
+	}
+}
+
+// enableICELocked adds ICE to the live handshaker without disturbing relay.
+// Caller must hold conn.mu.
+func (conn *Conn) enableICELocked() (*Handshaker, error) {
+	if conn.workerICE == nil {
+		runConfig := conn.config
+		runConfig.ForceRelay = false
+		workerICE, err := NewWorkerICE(
+			conn.ctx,
+			conn.Log,
+			runConfig,
+			conn,
+			conn.signaler,
+			conn.iFaceDiscover,
+			conn.statusRecorder,
+			conn.workerRelay.RelayIsSupportedLocally(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		conn.workerICE = workerICE
+		conn.workerICESnapshot.Store(workerICE)
+		conn.handshaker.setICEWorker(workerICE)
+	}
+
+	conn.immediateEndpointUpdates &^= immediateEndpointRelay
+	conn.immediateEndpointUpdates |= immediateEndpointICE
+	conn.forceRelay.Store(false)
+	return conn.handshaker, nil
+}
+
+// enableForceRelayLocked switches to an established relay before detaching ICE.
+// Caller must hold conn.mu.
+func (conn *Conn) enableForceRelayLocked() (retiredICETransport, bool, error) {
+	if conn.workerICE == nil {
+		conn.forceRelay.Store(true)
+		return retiredICETransport{}, true, nil
+	}
+	if conn.wgProxyRelay == nil || conn.statusRelay.Get() != worker.StatusConnected {
+		return retiredICETransport{}, false, nil
+	}
+
+	if conn.currentConnPriority != conntype.Relay {
+		relayEndpoint := conn.wgProxyRelay.EndpointAddr()
+		if relayEndpoint == nil {
+			return retiredICETransport{}, false, errors.New("relay endpoint is unavailable")
+		}
+		conn.wgProxyRelay.Work()
+		presharedKey := conn.presharedKey(conn.rosenpassRemoteKey)
+		if err := conn.endpointUpdater.SwitchWGEndpoint(relayEndpoint, presharedKey); err != nil {
+			conn.wgProxyRelay.Pause()
+			return retiredICETransport{}, false, fmt.Errorf("switch to relay endpoint: %w", err)
+		}
+		wgConfigWorkaround()
+		conn.currentConnPriority = conntype.Relay
+	}
+
+	conn.handshaker.setICEWorker(nil)
+	retired := retiredICETransport{
+		worker: conn.workerICE,
+		proxy:  conn.wgProxyICE,
+	}
+	conn.workerICE = nil
+	conn.workerICESnapshot.Store(nil)
+	conn.wgProxyICE = nil
+	conn.statusICE.SetDisconnected()
+	conn.immediateEndpointUpdates = 0
+	conn.forceRelay.Store(true)
+	conn.recordForceRelayTransitionLocked()
+	return retired, true, nil
+}
+
+// recordForceRelayTransitionLocked records the transport change without
+// reporting the peer disconnected. Caller must hold conn.mu.
+func (conn *Conn) recordForceRelayTransitionLocked() {
+	peerState := State{
+		PubKey:           conn.config.Key,
+		ConnStatus:       conn.evalStatus(),
+		Relayed:          true,
+		ConnStatusUpdate: time.Now(),
+	}
+	if err := conn.statusRecorder.UpdatePeerICEStateToDisconnected(peerState); err != nil {
+		conn.Log.Warnf("unable to record force-relay transition: %v", err)
+	}
+}
+
+func (conn *Conn) signalForceRelayUpdate(handshaker *Handshaker) {
+	if err := handshaker.SendOffer(); err != nil {
+		if errors.Is(err, ErrSignalIsNotReady) {
+			conn.Log.Debugf("defer force-relay transport signaling: %v", err)
+			return
+		}
+		conn.Log.Warnf("failed to signal force-relay transport update: %v", err)
+	}
 }
 
 func runtimeImmediateEndpointUpdates(forceRelay bool) immediateEndpointUpdate {
@@ -753,6 +892,7 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 	conn.dumpState.NewLocalProxy()
 
 	conn.Log.Infof("created new wgProxy for relay connection: %s", wgProxy.EndpointAddr().String())
+	conn.rosenpassRemoteKey = rci.rosenpassPubKey
 
 	if conn.isICEActive() {
 		conn.Log.Debugf("do not switch to relay because current priority is: %s", conn.currentConnPriority.String())
@@ -788,7 +928,6 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 
 	conn.injectPendingFirstPacket(wgProxy, nil)
 
-	conn.rosenpassRemoteKey = rci.rosenpassPubKey
 	conn.currentConnPriority = conntype.Relay
 	conn.statusRelay.SetConnected()
 	conn.setRelayedProxy(wgProxy)
@@ -1023,11 +1162,12 @@ func (conn *Conn) isConnectedOnAllWay() (status guard.ConnStatus) {
 		}
 	}()
 
-	iceWorkerCreated := conn.workerICE != nil
+	workerICE := conn.workerICESnapshot.Load()
+	iceWorkerCreated := workerICE != nil
 
 	var iceInProgress bool
 	if iceWorkerCreated {
-		iceInProgress = conn.workerICE.InProgress()
+		iceInProgress = workerICE.InProgress()
 	}
 
 	return evalConnStatus(connStatusInputs{
