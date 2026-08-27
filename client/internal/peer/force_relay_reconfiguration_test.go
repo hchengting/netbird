@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,12 @@ import (
 )
 
 type forceRelayTestWGIface struct{}
+
+type recordingForceRelayTestWGIface struct {
+	forceRelayTestWGIface
+	mu        sync.Mutex
+	endpoints []*net.UDPAddr
+}
 
 type forceRelayTestSignalClient struct{}
 
@@ -72,6 +79,25 @@ func (forceRelayTestWGIface) Address() wgaddr.Address {
 
 func (forceRelayTestWGIface) RemoveEndpointAddress(string) error {
 	return nil
+}
+
+func (f *recordingForceRelayTestWGIface) UpdatePeer(
+	_ string,
+	_ []netip.Prefix,
+	_ time.Duration,
+	endpoint *net.UDPAddr,
+	_ *wgtypes.Key,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.endpoints = append(f.endpoints, endpoint)
+	return nil
+}
+
+func (f *recordingForceRelayTestWGIface) recordedEndpoints() []*net.UDPAddr {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*net.UDPAddr(nil), f.endpoints...)
 }
 
 func TestConnReconfigureForceRelayRebuildsOnlyOpenTransports(t *testing.T) {
@@ -125,7 +151,102 @@ func TestConnReconfigureForceRelayDoesNotOpenLazyPeer(t *testing.T) {
 	require.NotNil(t, conn.workerICE, "the next activation must use the latest force-relay mode")
 }
 
+func TestConnReconfigureForceRelayProgramsFirstEndpointsImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	wgIface := &recordingForceRelayTestWGIface{}
+	conn := newForceRelayTestConnWithIface(t, ctx, true, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
+
+	restarted, err := conn.ReconfigureForceRelay(ctx, false)
+	require.NoError(t, err)
+	require.True(t, restarted, "an open peer must recycle its transports")
+
+	relayEndpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
+	iceEndpoint := &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 51820}
+
+	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+	require.NoError(t, configureForceRelayTestEndpoint(conn, iceEndpoint, immediateEndpointICE))
+	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+
+	endpoints := wgIface.recordedEndpoints()
+	require.Len(t, endpoints, 3, "each endpoint update must reach the interface")
+	require.Equal(t, relayEndpoint, endpoints[0], "relay endpoint must bypass responder fallback")
+	require.Equal(t, iceEndpoint, endpoints[1], "ICE endpoint must bypass responder fallback")
+	require.Nil(t, endpoints[2], "later relay updates must restore responder fallback")
+}
+
+func TestConnReconfigureForceRelayClearsRelayBypassWhenICEWinsFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	wgIface := &recordingForceRelayTestWGIface{}
+	conn := newForceRelayTestConnWithIface(t, ctx, true, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
+
+	restarted, err := conn.ReconfigureForceRelay(ctx, false)
+	require.NoError(t, err)
+	require.True(t, restarted, "an open peer must recycle its transports")
+
+	iceEndpoint := &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 51820}
+	relayEndpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
+
+	require.NoError(t, configureForceRelayTestEndpoint(conn, iceEndpoint, immediateEndpointICE))
+	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+
+	endpoints := wgIface.recordedEndpoints()
+	require.Len(t, endpoints, 2, "each endpoint update must reach the interface")
+	require.Equal(t, iceEndpoint, endpoints[0], "ICE endpoint must bypass responder fallback")
+	require.Nil(t, endpoints[1], "a late relay update must use normal responder fallback")
+}
+
+func TestConnReconfigureForceRelayProgramsRelayImmediatelyWhenEnabled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	wgIface := &recordingForceRelayTestWGIface{}
+	conn := newForceRelayTestConnWithIface(t, ctx, false, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
+
+	restarted, err := conn.ReconfigureForceRelay(ctx, true)
+	require.NoError(t, err)
+	require.True(t, restarted, "an open peer must recycle its transports")
+
+	relayEndpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
+	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+
+	endpoints := wgIface.recordedEndpoints()
+	require.Len(t, endpoints, 2, "each endpoint update must reach the interface")
+	require.Equal(t, relayEndpoint, endpoints[0], "relay endpoint must bypass responder fallback")
+	require.Nil(t, endpoints[1], "later relay updates must restore responder fallback")
+}
+
+func configureForceRelayTestEndpoint(
+	conn *Conn,
+	endpoint *net.UDPAddr,
+	target immediateEndpointUpdate,
+) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.configureWGEndpoint(endpoint, nil, target)
+}
+
 func newForceRelayTestConn(t *testing.T, ctx context.Context, forceRelay bool) *Conn {
+	t.Helper()
+	return newForceRelayTestConnWithIface(t, ctx, forceRelay, forceRelayTestWGIface{})
+}
+
+func newForceRelayTestConnWithIface(
+	t *testing.T,
+	ctx context.Context,
+	forceRelay bool,
+	wgIface WGIface,
+) *Conn {
 	t.Helper()
 
 	config := ConnConfig{
@@ -137,7 +258,7 @@ func newForceRelayTestConn(t *testing.T, ctx context.Context, forceRelay bool) *
 		WgConfig: WgConfig{
 			RemoteKey:   "remote-peer",
 			AllowedIps:  []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
-			WgInterface: forceRelayTestWGIface{},
+			WgInterface: wgIface,
 		},
 		ICEConfig: ice.Config{},
 	}

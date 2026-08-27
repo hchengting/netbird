@@ -38,6 +38,13 @@ import (
 // considered desynced and gets reset.
 const wgTimeoutEscalationThreshold = 3
 
+type immediateEndpointUpdate uint8
+
+const (
+	immediateEndpointRelay immediateEndpointUpdate = 1 << iota
+	immediateEndpointICE
+)
+
 // MetricsRecorder is an interface for recording peer connection metrics
 type MetricsRecorder interface {
 	RecordConnectionStages(
@@ -132,6 +139,9 @@ type Conn struct {
 	workerICE   *WorkerICE
 	workerRelay *WorkerRelay
 	forceRelay  atomic.Bool
+	// immediateEndpointUpdates is a one-shot mask for the first relay and ICE
+	// endpoint configurations in a runtime policy replacement. Guarded by mu.
+	immediateEndpointUpdates immediateEndpointUpdate
 
 	wgWatcher       *WGWatcher
 	wgWatcherWg     sync.WaitGroup
@@ -229,7 +239,7 @@ func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
 func (conn *Conn) Open(engineCtx context.Context) error {
 	conn.lifecycleMu.Lock()
 	defer conn.lifecycleMu.Unlock()
-	return conn.open(engineCtx, nil)
+	return conn.open(engineCtx, nil, 0)
 }
 
 // OpenWithFirstPacket opens the connection like Open and stashes firstPacket to be replayed once
@@ -237,10 +247,14 @@ func (conn *Conn) Open(engineCtx context.Context) error {
 func (conn *Conn) OpenWithFirstPacket(engineCtx context.Context, firstPacket []byte) error {
 	conn.lifecycleMu.Lock()
 	defer conn.lifecycleMu.Unlock()
-	return conn.open(engineCtx, firstPacket)
+	return conn.open(engineCtx, firstPacket, 0)
 }
 
-func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
+func (conn *Conn) open(
+	engineCtx context.Context,
+	firstPacket []byte,
+	immediateUpdates immediateEndpointUpdate,
+) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -283,6 +297,7 @@ func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
 	conn.workerICE = workerICE
 	conn.handshaker = handshaker
 	conn.guard = connectionGuard
+	conn.immediateEndpointUpdates = immediateUpdates
 
 	conn.wg.Add(1)
 	go func(handshaker *Handshaker, peerCtx context.Context) {
@@ -382,6 +397,7 @@ func (conn *Conn) close(signalToRemote bool) {
 	conn.workerICE = nil
 	conn.handshaker = nil
 	conn.guard = nil
+	conn.immediateEndpointUpdates = 0
 	conn.Log.Infof("peer connection closed")
 }
 
@@ -406,9 +422,9 @@ func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool)
 	}
 
 	conn.close(false)
-	if err := conn.open(engineCtx, nil); err != nil {
+	if err := conn.open(engineCtx, nil, runtimeImmediateEndpointUpdates(enabled)); err != nil {
 		conn.forceRelay.Store(previous)
-		if rollbackErr := conn.open(engineCtx, nil); rollbackErr != nil {
+		if rollbackErr := conn.open(engineCtx, nil, runtimeImmediateEndpointUpdates(previous)); rollbackErr != nil {
 			return true, fmt.Errorf(
 				"apply force-relay policy and restore previous policy: %w",
 				errors.Join(err, rollbackErr),
@@ -417,6 +433,13 @@ func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool)
 		return true, fmt.Errorf("apply force-relay policy (previous policy restored): %w", err)
 	}
 	return true, nil
+}
+
+func runtimeImmediateEndpointUpdates(forceRelay bool) immediateEndpointUpdate {
+	if forceRelay {
+		return immediateEndpointRelay
+	}
+	return immediateEndpointRelay | immediateEndpointICE
 }
 
 // ForceRelayEnabled reports the mode that the next or current connection run
@@ -616,7 +639,7 @@ func (conn *Conn) onICEConnectionIsReady(workerICE *WorkerICE, priority conntype
 	conn.enableWgWatcherIfNeeded(updateTime)
 
 	presharedKey := conn.presharedKey(iceConnInfo.RosenpassPubKey)
-	if err = conn.endpointUpdater.ConfigureWGEndpoint(ep, presharedKey); err != nil {
+	if err = conn.configureWGEndpoint(ep, presharedKey, immediateEndpointICE); err != nil {
 		conn.handleConfigurationFailure(err, wgProxy)
 		return
 	}
@@ -746,7 +769,11 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 	}
 	updateTime := time.Now()
 	conn.enableWgWatcherIfNeeded(updateTime)
-	if err := conn.endpointUpdater.ConfigureWGEndpoint(wgProxy.EndpointAddr(), conn.presharedKey(rci.rosenpassPubKey)); err != nil {
+	if err := conn.configureWGEndpoint(
+		wgProxy.EndpointAddr(),
+		conn.presharedKey(rci.rosenpassPubKey),
+		immediateEndpointRelay,
+	); err != nil {
 		if err := wgProxy.CloseConn(); err != nil {
 			conn.Log.Warnf("Failed to close relay connection: %v", err)
 		}
@@ -768,6 +795,27 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 	conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, updateTime)
 	conn.Log.Infof("start to communicate with peer via relay")
 	conn.doOnConnected(rci.rosenpassPubKey, rci.rosenpassAddr, updateTime)
+}
+
+// configureWGEndpoint programs the endpoint selected by a ready transport.
+// Caller must hold conn.mu.
+func (conn *Conn) configureWGEndpoint(
+	endpoint *net.UDPAddr,
+	presharedKey *wgtypes.Key,
+	target immediateEndpointUpdate,
+) error {
+	if conn.immediateEndpointUpdates&target != 0 {
+		if err := conn.endpointUpdater.SwitchWGEndpoint(endpoint, presharedKey); err != nil {
+			return err
+		}
+		if target == immediateEndpointICE {
+			conn.immediateEndpointUpdates = 0
+		} else {
+			conn.immediateEndpointUpdates &^= target
+		}
+		return nil
+	}
+	return conn.endpointUpdater.ConfigureWGEndpoint(endpoint, presharedKey)
 }
 
 func (conn *Conn) onRelayDisconnected(workerRelay *WorkerRelay) {
