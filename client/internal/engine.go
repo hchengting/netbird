@@ -437,30 +437,91 @@ func (e *Engine) SetForceRelay(enabled bool) error {
 		e.srWatcher.SetICEMonitorEnabled(true)
 	}
 
-	var merr *multierror.Error
+	reconfigurationStart := time.Now()
 	reconfigured := 0
+	var reconfigureErr error
 	if e.peerStore != nil {
-		for _, peerKey := range e.peerStore.PeersPubKey() {
-			conn, ok := e.peerStore.PeerConn(peerKey)
-			if !ok {
-				continue
-			}
-			peerReconfigured, err := conn.ReconfigureForceRelay(e.ctx, enabled)
-			if err != nil {
-				merr = multierror.Append(merr, fmt.Errorf("reconfigure peer %s: %w", peerKey, err))
-				continue
-			}
-			if peerReconfigured {
-				reconfigured++
-			}
-		}
+		reconfigured, reconfigureErr = reconfigureForceRelayPeers(
+			e.peerStore.PeersPubKey(),
+			func(peerKey string) (bool, error) {
+				conn, ok := e.peerStore.PeerConn(peerKey)
+				if !ok {
+					return false, nil
+				}
+				return conn.ReconfigureForceRelay(e.ctx, enabled)
+			},
+		)
 	}
 	if enabled && e.srWatcher != nil {
 		e.srWatcher.SetICEMonitorEnabled(false)
 	}
 
-	log.Infof("force-relay runtime request updated to %t; reconfigured %d open peers", enabled, reconfigured)
-	return nberrors.FormatErrorOrNil(merr)
+	log.Infof(
+		"force-relay runtime request updated to %t; reconfigured %d open peers in %s",
+		enabled,
+		reconfigured,
+		time.Since(reconfigurationStart).Round(time.Millisecond),
+	)
+	return reconfigureErr
+}
+
+// WGIface serializes device writes. This limit bounds peer work while allowing
+// peer-local stabilization waits and signaling to overlap.
+const maxConcurrentForceRelayReconfigurations = 8
+
+type forceRelayReconfigurationResult struct {
+	reconfigured bool
+	err          error
+}
+
+func reconfigureForceRelayPeers(
+	peerKeys []string,
+	reconfigure func(string) (bool, error),
+) (int, error) {
+	if len(peerKeys) == 0 {
+		return 0, nil
+	}
+
+	results := make([]forceRelayReconfigurationResult, len(peerKeys))
+	jobs := make(chan int)
+	workerCount := min(maxConcurrentForceRelayReconfigurations, len(peerKeys))
+
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				reconfigured, err := reconfigure(peerKeys[index])
+				results[index] = forceRelayReconfigurationResult{
+					reconfigured: reconfigured,
+					err:          err,
+				}
+			}
+		}()
+	}
+
+	for index := range peerKeys {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+
+	var merr *multierror.Error
+	reconfigured := 0
+	for index, result := range results {
+		if result.err != nil {
+			merr = multierror.Append(
+				merr,
+				fmt.Errorf("reconfigure peer %s: %w", peerKeys[index], result.err),
+			)
+			continue
+		}
+		if result.reconfigured {
+			reconfigured++
+		}
+	}
+	return reconfigured, nberrors.FormatErrorOrNil(merr)
 }
 
 // ForceRelayEnabled reports the engine-owned transport policy.
