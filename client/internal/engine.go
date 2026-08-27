@@ -430,8 +430,11 @@ func (e *Engine) SetForceRelay(enabled bool) error {
 		return fmt.Errorf("engine is stopped: %w", err)
 	}
 	e.forceRelay.Store(enabled)
-	if e.srWatcher != nil {
-		e.srWatcher.SetICEMonitorEnabled(!enabled)
+	// Enable the base monitor before adding ICE. When enabling force relay,
+	// pending peers acquire per-peer monitor requirements before the base policy
+	// is disabled below, avoiding a stop/start gap in candidate observation.
+	if !enabled && e.srWatcher != nil {
+		e.srWatcher.SetICEMonitorEnabled(true)
 	}
 
 	var merr *multierror.Error
@@ -452,8 +455,11 @@ func (e *Engine) SetForceRelay(enabled bool) error {
 			}
 		}
 	}
+	if enabled && e.srWatcher != nil {
+		e.srWatcher.SetICEMonitorEnabled(false)
+	}
 
-	log.Infof("force-relay runtime policy updated to %t; reconfigured %d open peers", enabled, reconfigured)
+	log.Infof("force-relay runtime request updated to %t; reconfigured %d open peers", enabled, reconfigured)
 	return nberrors.FormatErrorOrNil(merr)
 }
 

@@ -3,6 +3,8 @@ package peer
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/netbirdio/netbird/client/internal/peer/guard"
 )
 
@@ -15,27 +17,27 @@ func TestEvalConnStatus_ForceRelay(t *testing.T) {
 		{
 			name: "force relay, peer uses relay, relay up",
 			in: connStatusInputs{
-				forceRelay:     true,
-				peerUsesRelay:  true,
-				relayConnected: true,
+				forceRelayApplied: true,
+				peerUsesRelay:     true,
+				relayConnected:    true,
 			},
 			want: guard.ConnStatusConnected,
 		},
 		{
 			name: "force relay, peer uses relay, relay down",
 			in: connStatusInputs{
-				forceRelay:     true,
-				peerUsesRelay:  true,
-				relayConnected: false,
+				forceRelayApplied: true,
+				peerUsesRelay:     true,
+				relayConnected:    false,
 			},
 			want: guard.ConnStatusDisconnected,
 		},
 		{
 			name: "force relay, peer does NOT use relay - disconnected forever",
 			in: connStatusInputs{
-				forceRelay:     true,
-				peerUsesRelay:  false,
-				relayConnected: true,
+				forceRelayApplied: true,
+				peerUsesRelay:     false,
+				relayConnected:    true,
 			},
 			want: guard.ConnStatusDisconnected,
 		},
@@ -46,6 +48,37 @@ func TestEvalConnStatus_ForceRelay(t *testing.T) {
 			if got := evalConnStatus(tc.in); got != tc.want {
 				t.Fatalf("evalConnStatus = %v, want %v", got, tc.want)
 			}
+		})
+	}
+}
+
+func TestEvalConnStatus_ForceRelayPending(t *testing.T) {
+	tests := []struct {
+		name string
+		in   connStatusInputs
+		want guard.ConnStatus
+	}{
+		{
+			name: "working ICE remains usable while relay is pending",
+			in: connStatusInputs{
+				forceRelayPending: true,
+				iceConnected:      true,
+			},
+			want: guard.ConnStatusPartiallyConnected,
+		},
+		{
+			name: "pending peer with no working ICE is disconnected",
+			in: connStatusInputs{
+				forceRelayPending: true,
+				iceConnected:      false,
+			},
+			want: guard.ConnStatusDisconnected,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, evalConnStatus(tc.in))
 		})
 	}
 }

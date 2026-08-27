@@ -36,7 +36,9 @@ func TestEngineSetForceRelayUpdatesClosedPeersWithoutRestart(t *testing.T) {
 
 	require.NoError(t, engine.SetForceRelay(true))
 	require.True(t, engine.ForceRelayEnabled())
+	require.True(t, conn.ForceRelayDesired())
 	require.True(t, conn.ForceRelayEnabled())
+	require.False(t, conn.ForceRelayPending())
 
 	require.NoError(t, engine.SetForceRelay(true), "idempotent update must be a no-op")
 }

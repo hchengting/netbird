@@ -31,6 +31,7 @@ type recordingForceRelayTestWGIface struct {
 	endpoints    []*net.UDPAddr
 	removedPeers int
 	updateErr    error
+	proxy        wgproxy.Proxy
 }
 
 type forceRelayTestProxy struct {
@@ -118,6 +119,10 @@ func (f *recordingForceRelayTestWGIface) RemovePeer(string) error {
 	return nil
 }
 
+func (f *recordingForceRelayTestWGIface) GetProxy() wgproxy.Proxy {
+	return f.proxy
+}
+
 func (f *recordingForceRelayTestWGIface) removePeerCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -179,6 +184,8 @@ func TestConnReconfigureForceRelayKeepsOpenTransportRun(t *testing.T) {
 	t.Cleanup(func() { conn.Close(false) })
 
 	require.True(t, conn.ForceRelayEnabled())
+	require.True(t, conn.ForceRelayDesired())
+	require.False(t, conn.ForceRelayPending())
 	require.Nil(t, conn.workerICE, "force-relay connection must not create an ICE worker")
 	originalRelayWorker := conn.workerRelay
 	originalHandshaker := conn.handshaker
@@ -188,6 +195,8 @@ func TestConnReconfigureForceRelayKeepsOpenTransportRun(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, reconfigured, "an open peer must apply the policy in place")
 	require.False(t, conn.ForceRelayEnabled())
+	require.False(t, conn.ForceRelayDesired())
+	require.False(t, conn.ForceRelayPending())
 	require.NotNil(t, conn.workerICE, "disabling force relay must create a fresh ICE worker")
 	require.Same(t, originalRelayWorker, conn.workerRelay,
 		"the established relay worker must survive ICE enablement")
@@ -233,6 +242,8 @@ func TestConnReconfigureForceRelayUsesReadyRelayBeforeRetiringICE(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, reconfigured, "an open peer must apply the relay policy in place")
 	require.True(t, conn.ForceRelayEnabled())
+	require.True(t, conn.ForceRelayDesired())
+	require.False(t, conn.ForceRelayPending())
 	require.Nil(t, conn.workerICE,
 		"ICE must retire only after the relay endpoint is active")
 	require.Same(t, originalRelayWorker, conn.workerRelay,
@@ -288,6 +299,10 @@ func TestConnReconfigureForceRelayKeepsICEWhenRelayEndpointUpdateFails(t *testin
 	require.True(t, reconfigured, "the open peer must report the attempted policy change")
 	require.False(t, conn.ForceRelayEnabled(),
 		"a failed relay switch must preserve the applied ICE policy")
+	require.True(t, conn.ForceRelayDesired(),
+		"a failed relay switch must retain the requested relay policy")
+	require.True(t, conn.ForceRelayPending(),
+		"a failed relay switch must remain pending on the working ICE path")
 	require.Same(t, originalICEWorker, conn.workerICE,
 		"a failed relay switch must keep the active ICE worker")
 	require.Equal(t, conntype.ICEP2P, conn.currentConnPriority,
@@ -378,7 +393,7 @@ func TestConnReconfigureForceRelayKeepsRelayFallbackWhileArmingICE(t *testing.T)
 	require.Equal(t, iceEndpoint, endpoints[1], "the new ICE endpoint must bypass responder fallback")
 }
 
-func TestConnReconfigureForceRelayProgramsRelayImmediatelyWhenEnabled(t *testing.T) {
+func TestConnReconfigureForceRelayWaitsForRelayWithoutRecycling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -386,22 +401,158 @@ func TestConnReconfigureForceRelayProgramsRelayImmediatelyWhenEnabled(t *testing
 	conn := newForceRelayTestConnWithIface(t, ctx, false, wgIface)
 	require.NoError(t, conn.Open(ctx))
 	t.Cleanup(func() { conn.Close(false) })
+	originalICEWorker := conn.workerICE
+	originalRelayWorker := conn.workerRelay
+	originalHandshaker := conn.handshaker
+	originalRunContext := conn.ctx
 
 	reconfigured, err := conn.ReconfigureForceRelay(ctx, true)
 	require.NoError(t, err)
-	require.True(t, reconfigured, "an open peer without a ready relay must use fallback replacement")
-	require.Nil(t, conn.workerICE,
-		"the fallback replacement must apply relay-only mode")
-	assertForceRelayTestTransportCounts(t, wgIface, 1)
+	require.True(t, reconfigured, "an open peer must accept the requested relay policy")
+	require.False(t, conn.ForceRelayEnabled(),
+		"relay-only mode is not applied until a relay transport is ready")
+	require.True(t, conn.ForceRelayDesired())
+	require.True(t, conn.ForceRelayPending())
+	require.Same(t, originalICEWorker, conn.workerICE,
+		"the active ICE worker must remain available while relay is pending")
+	require.Same(t, originalRelayWorker, conn.workerRelay,
+		"waiting for relay must not replace its worker")
+	require.Same(t, originalHandshaker, conn.handshaker,
+		"waiting for relay must not replace the handshaker")
+	require.Equal(t, originalRunContext, conn.ctx,
+		"waiting for relay must not cancel the peer run")
+	offer := conn.handshaker.buildOfferAnswer()
+	require.True(t, offer.hasICECredentials(),
+		"pending force relay must keep advertising the working ICE path")
+	assertForceRelayTestTransportCounts(t, wgIface, 0)
+	require.Empty(t, wgIface.recordedEndpoints(),
+		"the WireGuard endpoint must not change before relay is ready")
+}
+
+func TestConnPendingForceRelayCompletesWhenRelayBecomesReady(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	relayEndpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
-	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
-	require.NoError(t, configureForceRelayTestEndpoint(conn, relayEndpoint, immediateEndpointRelay))
+	relayProxy := &forceRelayTestProxy{endpoint: relayEndpoint}
+	wgIface := &recordingForceRelayTestWGIface{proxy: relayProxy}
+	conn := newForceRelayTestConnWithIface(t, ctx, false, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
 
-	endpoints := wgIface.recordedEndpoints()
-	require.Len(t, endpoints, 2, "each endpoint update must reach the interface")
-	require.Equal(t, relayEndpoint, endpoints[0], "relay endpoint must bypass responder fallback")
-	require.Nil(t, endpoints[1], "later relay updates must restore responder fallback")
+	iceProxy := &forceRelayTestProxy{
+		endpoint: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 51820},
+	}
+	conn.mu.Lock()
+	conn.wgProxyICE = iceProxy
+	conn.currentConnPriority = conntype.ICEP2P
+	conn.statusICE.SetConnected()
+	originalRunContext := conn.ctx
+	originalHandshaker := conn.handshaker
+	originalRelayWorker := conn.workerRelay
+	conn.mu.Unlock()
+
+	reconfigured, err := conn.ReconfigureForceRelay(ctx, true)
+	require.NoError(t, err)
+	require.True(t, reconfigured)
+	require.True(t, conn.ForceRelayPending())
+
+	localRelayConn, remoteRelayConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = localRelayConn.Close()
+		_ = remoteRelayConn.Close()
+	})
+	conn.onRelayConnectionIsReady(conn.workerRelay, RelayConnInfo{relayedConn: localRelayConn})
+
+	require.True(t, conn.ForceRelayDesired())
+	require.True(t, conn.ForceRelayEnabled())
+	require.False(t, conn.ForceRelayPending())
+	require.Nil(t, conn.workerICE, "ICE must retire after the pending relay becomes ready")
+	require.Equal(t, conntype.Relay, conn.currentConnPriority)
+	require.Equal(t, originalRunContext, conn.ctx)
+	require.Same(t, originalHandshaker, conn.handshaker)
+	require.Same(t, originalRelayWorker, conn.workerRelay)
+	require.Equal(t, []*net.UDPAddr{relayEndpoint}, wgIface.recordedEndpoints())
+	require.Zero(t, wgIface.removePeerCount())
+	offer := conn.handshaker.buildOfferAnswer()
+	require.False(t, offer.hasICECredentials())
+	work, pause, _ := relayProxy.counts()
+	require.Equal(t, 1, work)
+	require.Zero(t, pause)
+	_, _, iceClose := iceProxy.counts()
+	require.Equal(t, 1, iceClose)
+}
+
+func TestConnPendingForceRelayCanBeCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	wgIface := &recordingForceRelayTestWGIface{}
+	conn := newForceRelayTestConnWithIface(t, ctx, false, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
+	originalICEWorker := conn.workerICE
+	originalRunContext := conn.ctx
+
+	reconfigured, err := conn.ReconfigureForceRelay(ctx, true)
+	require.NoError(t, err)
+	require.True(t, reconfigured)
+	require.True(t, conn.ForceRelayPending())
+
+	reconfigured, err = conn.ReconfigureForceRelay(ctx, false)
+	require.NoError(t, err)
+	require.True(t, reconfigured)
+	require.False(t, conn.ForceRelayDesired())
+	require.False(t, conn.ForceRelayEnabled())
+	require.False(t, conn.ForceRelayPending())
+	require.Same(t, originalICEWorker, conn.workerICE)
+	require.Equal(t, originalRunContext, conn.ctx)
+	require.Zero(t, wgIface.removePeerCount())
+	offer := conn.handshaker.buildOfferAnswer()
+	require.True(t, offer.hasICECredentials())
+}
+
+func TestConnPendingForceRelayCompletesAfterICEIsLost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	relayEndpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
+	relayProxy := &forceRelayTestProxy{endpoint: relayEndpoint}
+	wgIface := &recordingForceRelayTestWGIface{proxy: relayProxy}
+	conn := newForceRelayTestConnWithIface(t, ctx, false, wgIface)
+	require.NoError(t, conn.Open(ctx))
+	t.Cleanup(func() { conn.Close(false) })
+	originalRunContext := conn.ctx
+	originalHandshaker := conn.handshaker
+	originalRelayWorker := conn.workerRelay
+
+	reconfigured, err := conn.ReconfigureForceRelay(ctx, true)
+	require.NoError(t, err)
+	require.True(t, reconfigured)
+	require.True(t, conn.ForceRelayPending())
+
+	conn.mu.Lock()
+	conn.currentConnPriority = conntype.None
+	conn.statusICE.SetDisconnected()
+	conn.mu.Unlock()
+
+	localRelayConn, remoteRelayConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = localRelayConn.Close()
+		_ = remoteRelayConn.Close()
+	})
+	conn.onRelayConnectionIsReady(conn.workerRelay, RelayConnInfo{relayedConn: localRelayConn})
+
+	require.True(t, conn.ForceRelayEnabled())
+	require.False(t, conn.ForceRelayPending())
+	require.Nil(t, conn.workerICE)
+	require.Equal(t, conntype.Relay, conn.currentConnPriority)
+	require.Equal(t, originalRunContext, conn.ctx)
+	require.Same(t, originalHandshaker, conn.handshaker)
+	require.Same(t, originalRelayWorker, conn.workerRelay)
+	require.Equal(t, []*net.UDPAddr{relayEndpoint}, wgIface.recordedEndpoints(),
+		"a pending peer with no old path must program relay without responder delay")
+	require.Zero(t, wgIface.removePeerCount())
 }
 
 func configureForceRelayTestEndpoint(

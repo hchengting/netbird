@@ -24,25 +24,28 @@ type SRWatcher struct {
 	signalClient chNotifier
 	relayManager chNotifier
 
-	listeners        map[chan struct{}]struct{}
-	mu               sync.Mutex
-	iFaceDiscover    stdnet.ExternalIFaceDiscover
-	iceConfig        ice.Config
-	started          bool
-	cancelIceMonitor context.CancelFunc
-	iceMonitorRun    uint64
-	newICEMonitor    func(stdnet.ExternalIFaceDiscover, ice.Config, time.Duration) iceMonitor
+	listeners              map[chan struct{}]struct{}
+	mu                     sync.Mutex
+	iFaceDiscover          stdnet.ExternalIFaceDiscover
+	iceConfig              ice.Config
+	started                bool
+	cancelIceMonitor       context.CancelFunc
+	iceMonitorRun          uint64
+	iceMonitorEnabled      bool
+	iceMonitorRequirements map[string]struct{}
+	newICEMonitor          func(stdnet.ExternalIFaceDiscover, ice.Config, time.Duration) iceMonitor
 }
 
 // NewSRWatcher creates a new SRWatcher. This watcher will notify the listeners when the ICE candidates change or the
 // Relay connection is reconnected or the Signal client reconnected.
 func NewSRWatcher(signalClient chNotifier, relayManager chNotifier, iFaceDiscover stdnet.ExternalIFaceDiscover, iceConfig ice.Config) *SRWatcher {
 	srw := &SRWatcher{
-		signalClient:  signalClient,
-		relayManager:  relayManager,
-		iFaceDiscover: iFaceDiscover,
-		iceConfig:     iceConfig,
-		listeners:     make(map[chan struct{}]struct{}),
+		signalClient:           signalClient,
+		relayManager:           relayManager,
+		iFaceDiscover:          iFaceDiscover,
+		iceConfig:              iceConfig,
+		listeners:              make(map[chan struct{}]struct{}),
+		iceMonitorRequirements: make(map[string]struct{}),
 		newICEMonitor: func(discover stdnet.ExternalIFaceDiscover, config ice.Config, period time.Duration) iceMonitor {
 			return NewICEMonitor(discover, config, period)
 		},
@@ -58,13 +61,11 @@ func (w *SRWatcher) Start(disableICEMonitor bool) {
 		return
 	}
 	w.started = true
+	w.iceMonitorEnabled = !disableICEMonitor
 
 	w.signalClient.SetOnReconnectedListener(w.onReconnected)
 	w.relayManager.SetOnReconnectedListener(w.onReconnected)
-
-	if !disableICEMonitor {
-		w.startICEMonitorLocked()
-	}
+	w.reconcileICEMonitorLocked()
 }
 
 // SetICEMonitorEnabled changes only ICE candidate monitoring. Signal and relay
@@ -73,20 +74,35 @@ func (w *SRWatcher) SetICEMonitorEnabled(enabled bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.iceMonitorEnabled = enabled
 	if !w.started {
 		return
 	}
-	if enabled {
-		w.startICEMonitorLocked()
-		return
+	w.reconcileICEMonitorLocked()
+}
+
+// SetPeerICEMonitorRequired keeps ICE candidate monitoring active for a peer
+// whose requested transport policy is pending while its existing ICE path is
+// still applied.
+func (w *SRWatcher) SetPeerICEMonitorRequired(peerKey string, required bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if required {
+		w.iceMonitorRequirements[peerKey] = struct{}{}
+	} else {
+		delete(w.iceMonitorRequirements, peerKey)
 	}
-	w.stopICEMonitorLocked()
+	if w.started {
+		w.reconcileICEMonitorLocked()
+	}
 }
 
 func (w *SRWatcher) Close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	clear(w.iceMonitorRequirements)
 	if !w.started {
 		return
 	}
@@ -94,6 +110,14 @@ func (w *SRWatcher) Close() {
 	w.stopICEMonitorLocked()
 	w.signalClient.SetOnReconnectedListener(nil)
 	w.relayManager.SetOnReconnectedListener(nil)
+}
+
+func (w *SRWatcher) reconcileICEMonitorLocked() {
+	if w.iceMonitorEnabled || len(w.iceMonitorRequirements) > 0 {
+		w.startICEMonitorLocked()
+		return
+	}
+	w.stopICEMonitorLocked()
 }
 
 func (w *SRWatcher) startICEMonitorLocked() {

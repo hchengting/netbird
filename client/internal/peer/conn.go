@@ -136,9 +136,9 @@ type Conn struct {
 	currentConnPriority conntype.ConnPriority
 	opened              bool // this flag is used to prevent close in case of not opened connection
 
-	workerICE   *WorkerICE
-	workerRelay *WorkerRelay
-	forceRelay  atomic.Bool
+	workerICE       *WorkerICE
+	workerRelay     *WorkerRelay
+	forceRelayState atomic.Uint32
 	// workerICESnapshot lets the guard inspect the optional worker without
 	// taking mu while Close waits for the guard to stop.
 	workerICESnapshot atomic.Pointer[WorkerICE]
@@ -175,6 +175,26 @@ type Conn struct {
 	// pendingFirstPacket is the lazyconn-captured handshake init, replayed once the real
 	// transport is up.
 	pendingFirstPacket []byte
+}
+
+type forceRelayState uint32
+
+const (
+	forceRelayStateDisabled forceRelayState = iota
+	forceRelayStatePending
+	forceRelayStateEnabled
+)
+
+func (s forceRelayState) desired() bool {
+	return s != forceRelayStateDisabled
+}
+
+func (s forceRelayState) applied() bool {
+	return s == forceRelayStateEnabled
+}
+
+func (s forceRelayState) pending() bool {
+	return s == forceRelayStatePending
 }
 
 // injectPendingFirstPacket replays the captured handshake through the proxy if present, else
@@ -231,7 +251,9 @@ func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
 		endpointUpdater:    NewEndpointUpdater(connLog, config.WgConfig, isController(config)),
 		metricsRecorder:    services.MetricsRecorder,
 	}
-	conn.forceRelay.Store(config.ForceRelay)
+	if config.ForceRelay {
+		conn.forceRelayState.Store(uint32(forceRelayStateEnabled))
+	}
 
 	return conn, nil
 }
@@ -267,7 +289,7 @@ func (conn *Conn) open(
 
 	metricsStages := &MetricsStages{}
 	peerCtx, peerCtxCancel := context.WithCancel(engineCtx)
-	forceRelay := conn.forceRelay.Load()
+	forceRelay := conn.loadForceRelayState().desired()
 	runConfig := conn.config
 	runConfig.ForceRelay = forceRelay
 	workerRelay := NewWorkerRelay(peerCtx, conn.Log, isController(runConfig), runConfig, conn, conn.relayManager)
@@ -302,6 +324,11 @@ func (conn *Conn) open(
 	conn.handshaker = handshaker
 	conn.guard = connectionGuard
 	conn.immediateEndpointUpdates = immediateUpdates
+	if forceRelay {
+		conn.setForceRelayState(forceRelayStateEnabled)
+	} else {
+		conn.setForceRelayState(forceRelayStateDisabled)
+	}
 
 	conn.wg.Add(1)
 	go func(handshaker *Handshaker, peerCtx context.Context) {
@@ -343,6 +370,7 @@ func (conn *Conn) close(signalToRemote bool) {
 	conn.mu.Lock()
 	defer conn.wgWatcherWg.Wait()
 	defer conn.mu.Unlock()
+	conn.setPendingICEMonitorRequired(false)
 
 	if !conn.opened {
 		conn.Log.Debugf("ignore close connection to peer")
@@ -409,58 +437,65 @@ func (conn *Conn) close(signalToRemote bool) {
 // ReconfigureForceRelay applies a transport policy change to an open peer while
 // preserving an available relay or ICE path. Closed lazy peers remain idle and
 // use the new mode on the next activation.
-func (conn *Conn) ReconfigureForceRelay(engineCtx context.Context, enabled bool) (bool, error) {
+func (conn *Conn) ReconfigureForceRelay(_ context.Context, enabled bool) (bool, error) {
 	conn.lifecycleMu.Lock()
 	defer conn.lifecycleMu.Unlock()
 
-	previous := conn.forceRelay.Load()
-	if previous == enabled {
-		return false, nil
-	}
-
 	conn.mu.Lock()
-	opened := conn.opened
-	if !opened {
-		conn.forceRelay.Store(enabled)
+	state := conn.loadForceRelayState()
+	if !conn.opened {
+		if enabled {
+			conn.setForceRelayState(forceRelayStateEnabled)
+		} else {
+			conn.setForceRelayState(forceRelayStateDisabled)
+		}
 		conn.mu.Unlock()
 		return false, nil
 	}
 
 	if !enabled {
+		if state == forceRelayStateDisabled {
+			conn.mu.Unlock()
+			return false, nil
+		}
 		handshaker, err := conn.enableICELocked()
 		conn.mu.Unlock()
 		if err != nil {
 			return true, err
 		}
+		if state.pending() {
+			conn.Log.Infof("cancelled pending force-relay transition; keep ICE active")
+		}
 		conn.signalForceRelayUpdate(handshaker)
 		return true, nil
 	}
 
+	if state == forceRelayStateEnabled {
+		conn.mu.Unlock()
+		return false, nil
+	}
+	wasPending := state.pending()
+	conn.setForceRelayState(forceRelayStatePending)
+	conn.immediateEndpointUpdates |= immediateEndpointRelay
 	retiredICE, applied, err := conn.enableForceRelayLocked()
 	handshaker := conn.handshaker
 	conn.mu.Unlock()
 	if err != nil {
-		return true, err
+		conn.Log.Warnf("force-relay transition remains pending after relay switch failed: %v", err)
+		return !wasPending, err
 	}
 	if applied {
+		conn.Log.Infof("force-relay transition applied using ready relay")
 		conn.signalForceRelayUpdate(handshaker)
 		retiredICE.close(conn.Log)
 		return true, nil
 	}
 
-	conn.forceRelay.Store(enabled)
-	conn.close(false)
-	if err := conn.open(engineCtx, nil, runtimeImmediateEndpointUpdates(enabled)); err != nil {
-		conn.forceRelay.Store(previous)
-		if rollbackErr := conn.open(engineCtx, nil, runtimeImmediateEndpointUpdates(previous)); rollbackErr != nil {
-			return true, fmt.Errorf(
-				"apply force-relay policy and restore previous policy: %w",
-				errors.Join(err, rollbackErr),
-			)
-		}
-		return true, fmt.Errorf("apply force-relay policy (previous policy restored): %w", err)
+	if !wasPending {
+		conn.Log.Infof("force-relay transition pending; keep ICE active until relay is ready")
 	}
-	return true, nil
+	conn.signalForceRelayUpdate(handshaker)
+	return !wasPending, nil
 }
 
 type retiredICETransport struct {
@@ -505,7 +540,7 @@ func (conn *Conn) enableICELocked() (*Handshaker, error) {
 
 	conn.immediateEndpointUpdates &^= immediateEndpointRelay
 	conn.immediateEndpointUpdates |= immediateEndpointICE
-	conn.forceRelay.Store(false)
+	conn.setForceRelayState(forceRelayStateDisabled)
 	return conn.handshaker, nil
 }
 
@@ -513,7 +548,7 @@ func (conn *Conn) enableICELocked() (*Handshaker, error) {
 // Caller must hold conn.mu.
 func (conn *Conn) enableForceRelayLocked() (retiredICETransport, bool, error) {
 	if conn.workerICE == nil {
-		conn.forceRelay.Store(true)
+		conn.setForceRelayState(forceRelayStateEnabled)
 		return retiredICETransport{}, true, nil
 	}
 	if conn.wgProxyRelay == nil || conn.statusRelay.Get() != worker.StatusConnected {
@@ -545,7 +580,7 @@ func (conn *Conn) enableForceRelayLocked() (retiredICETransport, bool, error) {
 	conn.wgProxyICE = nil
 	conn.statusICE.SetDisconnected()
 	conn.immediateEndpointUpdates = 0
-	conn.forceRelay.Store(true)
+	conn.setForceRelayState(forceRelayStateEnabled)
 	conn.recordForceRelayTransitionLocked()
 	return retired, true, nil
 }
@@ -574,17 +609,39 @@ func (conn *Conn) signalForceRelayUpdate(handshaker *Handshaker) {
 	}
 }
 
-func runtimeImmediateEndpointUpdates(forceRelay bool) immediateEndpointUpdate {
-	if forceRelay {
-		return immediateEndpointRelay
-	}
-	return immediateEndpointRelay | immediateEndpointICE
+// ForceRelayEnabled reports whether relay-only mode is applied to the current
+// connection run, or selected for the next closed lazy-peer run.
+func (conn *Conn) ForceRelayEnabled() bool {
+	return conn.loadForceRelayState().applied()
 }
 
-// ForceRelayEnabled reports the mode that the next or current connection run
-// uses.
-func (conn *Conn) ForceRelayEnabled() bool {
-	return conn.forceRelay.Load()
+// ForceRelayDesired reports whether relay-only mode is requested, including a
+// pending transition that is still using ICE.
+func (conn *Conn) ForceRelayDesired() bool {
+	return conn.loadForceRelayState().desired()
+}
+
+// ForceRelayPending reports that relay-only mode is requested but the peer is
+// preserving ICE until a relay connection becomes ready.
+func (conn *Conn) ForceRelayPending() bool {
+	return conn.loadForceRelayState().pending()
+}
+
+func (conn *Conn) loadForceRelayState() forceRelayState {
+	return forceRelayState(conn.forceRelayState.Load())
+}
+
+// setForceRelayState publishes a consistent desired/applied/pending snapshot
+// and keeps the shared ICE monitor alive for the pending peer.
+func (conn *Conn) setForceRelayState(state forceRelayState) {
+	conn.forceRelayState.Store(uint32(state))
+	conn.setPendingICEMonitorRequired(state.pending())
+}
+
+func (conn *Conn) setPendingICEMonitorRequired(required bool) {
+	if conn.srWatcher != nil {
+		conn.srWatcher.SetPeerICEMonitorRequired(conn.config.Key, required)
+	}
 }
 
 // OnNetworkChange drops the ICE session bound to the transport the OS just
@@ -870,7 +927,15 @@ func (conn *Conn) handleICEDisconnectedLocked(sessionChanged bool) {
 
 func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayConnInfo) {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
+	var retiredICE retiredICETransport
+	var signalHandshaker *Handshaker
+	defer func() {
+		conn.mu.Unlock()
+		if signalHandshaker != nil {
+			conn.signalForceRelayUpdate(signalHandshaker)
+		}
+		retiredICE.close(conn.Log)
+	}()
 
 	if conn.workerRelay != workerRelay || workerRelay.peerCtx.Err() != nil {
 		if err := rci.relayedConn.Close(); err != nil {
@@ -899,6 +964,7 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 		conn.setRelayedProxy(wgProxy)
 		conn.statusRelay.SetConnected()
 		conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, time.Now())
+		retiredICE, signalHandshaker = conn.completePendingForceRelayLocked()
 		return
 	}
 
@@ -934,6 +1000,28 @@ func (conn *Conn) onRelayConnectionIsReady(workerRelay *WorkerRelay, rci RelayCo
 	conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, updateTime)
 	conn.Log.Infof("start to communicate with peer via relay")
 	conn.doOnConnected(rci.rosenpassPubKey, rci.rosenpassAddr, updateTime)
+	retiredICE, signalHandshaker = conn.completePendingForceRelayLocked()
+}
+
+// completePendingForceRelayLocked finalizes a pending request after the relay
+// callback has published a connected proxy. Caller must hold conn.mu.
+func (conn *Conn) completePendingForceRelayLocked() (retiredICETransport, *Handshaker) {
+	if !conn.loadForceRelayState().pending() {
+		return retiredICETransport{}, nil
+	}
+
+	retiredICE, applied, err := conn.enableForceRelayLocked()
+	if err != nil {
+		conn.Log.Errorf("failed to apply pending force-relay transition: %v", err)
+		conn.handleRelayDisconnectedLocked()
+		return retiredICETransport{}, nil
+	}
+	if !applied {
+		return retiredICETransport{}, nil
+	}
+
+	conn.Log.Infof("pending force-relay transition applied after relay became ready")
+	return retiredICE, conn.handshaker
 }
 
 // configureWGEndpoint programs the endpoint selected by a ready transport.
@@ -1153,7 +1241,7 @@ func (conn *Conn) evalStatus() ConnStatus {
 //
 // The result is a tri-state:
 //   - ConnStatusConnected:          all available transports are up
-//   - ConnStatusPartiallyConnected: relay is up but ICE is still pending/reconnecting
+//   - ConnStatusPartiallyConnected: one usable path exists while another is pending
 //   - ConnStatusDisconnected:       no working transport
 func (conn *Conn) isConnectedOnAllWay() (status guard.ConnStatus) {
 	defer func() {
@@ -1170,12 +1258,15 @@ func (conn *Conn) isConnectedOnAllWay() (status guard.ConnStatus) {
 		iceInProgress = workerICE.InProgress()
 	}
 
+	forceRelayState := conn.loadForceRelayState()
 	return evalConnStatus(connStatusInputs{
-		forceRelay:          conn.forceRelay.Load(),
+		forceRelayApplied:   forceRelayState.applied(),
+		forceRelayPending:   forceRelayState.pending(),
 		peerUsesRelay:       conn.workerRelay.IsRelayConnectionSupportedWithPeer(),
 		relayConnected:      conn.statusRelay.Get() == worker.StatusConnected,
 		remoteSupportsICE:   conn.handshaker.RemoteICESupported(),
 		iceWorkerCreated:    iceWorkerCreated,
+		iceConnected:        conn.statusICE.Get() == worker.StatusConnected,
 		iceStatusConnecting: conn.statusICE.Get() != worker.StatusDisconnected,
 		iceInProgress:       iceInProgress,
 	})
@@ -1374,8 +1465,18 @@ func evalConnStatus(in connStatusInputs) guard.ConnStatus {
 	// "Relay up and needed" — the peer uses relay and the transport is connected.
 	relayUsedAndUp := in.peerUsesRelay && in.relayConnected
 
+	// A pending force-relay transition deliberately keeps the old ICE data path
+	// alive. Report it as partial so the guard sends bounded relay probes without
+	// treating the still-usable peer as fully disconnected.
+	if in.forceRelayPending {
+		if in.iceConnected {
+			return guard.ConnStatusPartiallyConnected
+		}
+		return guard.ConnStatusDisconnected
+	}
+
 	// Force-relay mode: ICE never runs. Relay is the only transport and must be up.
-	if in.forceRelay {
+	if in.forceRelayApplied {
 		return boolToConnStatus(relayUsedAndUp)
 	}
 

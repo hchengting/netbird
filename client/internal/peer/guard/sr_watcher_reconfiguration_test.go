@@ -74,11 +74,52 @@ func TestSRWatcherTogglesOnlyICEMonitor(t *testing.T) {
 	require.Nil(t, relayNotifier.listener)
 }
 
+func TestSRWatcherKeepsICEMonitorForPendingPeer(t *testing.T) {
+	signalNotifier := &forceRelayTestNotifier{}
+	relayNotifier := &forceRelayTestNotifier{}
+	watcher := NewSRWatcher(signalNotifier, relayNotifier, nil, ice.Config{})
+	monitorStarted := make(chan struct{}, 1)
+	monitorStopped := make(chan struct{}, 1)
+	watcher.newICEMonitor = func(stdnet.ExternalIFaceDiscover, ice.Config, time.Duration) iceMonitor {
+		return &forceRelayTestICEMonitor{started: monitorStarted, stopped: monitorStopped}
+	}
+
+	watcher.Start(true)
+	watcher.SetPeerICEMonitorRequired("pending-peer-a", true)
+	watcher.SetPeerICEMonitorRequired("pending-peer-b", true)
+	requireSignal(t, monitorStarted, "pending peer should start the ICE monitor")
+
+	watcher.SetICEMonitorEnabled(false)
+	require.NotNil(t, watcher.cancelIceMonitor,
+		"disabling the base policy must not stop a monitor required by a pending peer")
+	requireNoSignal(t, monitorStopped,
+		"pending peer requirement should keep the ICE monitor running")
+
+	watcher.SetPeerICEMonitorRequired("pending-peer-a", false)
+	require.NotNil(t, watcher.cancelIceMonitor,
+		"one pending peer must keep the shared ICE monitor running")
+	requireNoSignal(t, monitorStopped,
+		"ICE monitor must wait for every pending peer requirement")
+
+	watcher.SetPeerICEMonitorRequired("pending-peer-b", false)
+	requireSignal(t, monitorStopped, "ICE monitor should stop after the final requirement is released")
+	watcher.Close()
+}
+
 func requireSignal(t *testing.T, ch <-chan struct{}, message string) {
 	t.Helper()
 	select {
 	case <-ch:
 	case <-time.After(time.Second):
 		t.Fatal(message)
+	}
+}
+
+func requireNoSignal(t *testing.T, ch <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatal(message)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
