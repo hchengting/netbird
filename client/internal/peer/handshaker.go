@@ -70,7 +70,8 @@ type Handshaker struct {
 	iceListener   func(remoteOfferAnswer *OfferAnswer)
 
 	// remoteICESupported tracks whether the remote peer includes ICE credentials in its offers/answers.
-	// When false, the local side skips ICE listener dispatch and suppresses ICE credentials in responses.
+	// When false, the local side skips ICE listener dispatch. Local ICE capability is still advertised so
+	// a peer that previously observed force-relay mode can discover that ICE is available again.
 	remoteICESupported atomic.Bool
 
 	// remoteOffersCh is a channel used to wait for remote credentials to proceed with the connection
@@ -109,7 +110,21 @@ func (h *Handshaker) AddRelayListener(offer func(remoteOfferAnswer *OfferAnswer)
 }
 
 func (h *Handshaker) AddICEListener(offer func(remoteOfferAnswer *OfferAnswer)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.iceListener = offer
+}
+
+func (h *Handshaker) setICEWorker(workerICE *WorkerICE) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.ice = workerICE
+	if workerICE == nil {
+		h.iceListener = nil
+		return
+	}
+	h.iceListener = workerICE.OnNewOffer
 }
 
 func (h *Handshaker) Listen(ctx context.Context) {
@@ -129,9 +144,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 				h.relayListener.Notify(&remoteOfferAnswer)
 			}
 
-			if h.iceListener != nil && h.RemoteICESupported() {
-				h.iceListener(&remoteOfferAnswer)
-			}
+			h.notifyICEListener(&remoteOfferAnswer)
 
 			if err := h.sendAnswer(); err != nil {
 				h.log.Errorf("failed to send remote offer confirmation: %s", err)
@@ -151,9 +164,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 				h.relayListener.Notify(&remoteOfferAnswer)
 			}
 
-			if h.iceListener != nil && h.RemoteICESupported() {
-				h.iceListener(&remoteOfferAnswer)
-			}
+			h.notifyICEListener(&remoteOfferAnswer)
 		case <-ctx.Done():
 			h.log.Infof("stop listening for remote offers and answers")
 			return
@@ -208,20 +219,29 @@ func (h *Handshaker) sendOffer() error {
 		return ErrSignalIsNotReady
 	}
 
-	offer := h.buildOfferAnswer()
+	offer := h.buildOfferAnswerLocked()
 	h.log.Debugf("sending offer with serial: %s", offer.SessionIDString())
 
 	return h.signaler.SignalOffer(offer, h.config.Key)
 }
 
 func (h *Handshaker) sendAnswer() error {
-	answer := h.buildOfferAnswer()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	answer := h.buildOfferAnswerLocked()
 	h.log.Debugf("sending answer with serial: %s", answer.SessionIDString())
 
 	return h.signaler.SignalAnswer(answer, h.config.Key)
 }
 
 func (h *Handshaker) buildOfferAnswer() OfferAnswer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.buildOfferAnswerLocked()
+}
+
+func (h *Handshaker) buildOfferAnswerLocked() OfferAnswer {
 	answer := OfferAnswer{
 		WgListenPort:    h.config.LocalWgPort,
 		Version:         version.NetbirdVersion(),
@@ -229,7 +249,10 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 		RosenpassAddr:   h.config.RosenpassConfig.Addr,
 	}
 
-	if h.ice != nil && h.RemoteICESupported() {
+	// Advertise local ICE capability independently of the last capability observed from the remote peer.
+	// Otherwise both peers can remain latched in relay-only mode after one side disables force-relay: the
+	// remote peer sends a credential-less offer first, and each side then suppresses its own credentials.
+	if h.ice != nil {
 		uFrag, pwd := h.ice.GetLocalUserCredentials()
 		sid := h.ice.SessionID()
 		answer.IceCredentials = IceCredentials{uFrag, pwd}
@@ -245,16 +268,34 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 }
 
 func (h *Handshaker) updateRemoteICEState(offer *OfferAnswer) {
+	h.mu.Lock()
 	hasICE := offer.hasICECredentials()
 	prev := h.remoteICESupported.Swap(hasICE)
+	var workerICE *WorkerICE
 	if prev != hasICE {
 		if hasICE {
 			h.log.Infof("remote peer started sending ICE credentials")
 		} else {
 			h.log.Infof("remote peer stopped sending ICE credentials")
-			if h.ice != nil {
-				h.ice.Close()
-			}
+			workerICE = h.ice
 		}
+	}
+	h.mu.Unlock()
+
+	if workerICE != nil {
+		workerICE.Close()
+	}
+}
+
+func (h *Handshaker) notifyICEListener(offer *OfferAnswer) {
+	h.mu.Lock()
+	var listener func(*OfferAnswer)
+	if h.iceListener != nil && h.RemoteICESupported() {
+		listener = h.iceListener
+	}
+	h.mu.Unlock()
+
+	if listener != nil {
+		listener(offer)
 	}
 }

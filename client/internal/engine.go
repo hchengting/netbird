@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -158,6 +159,10 @@ type EngineConfig struct {
 	// the env var and management feature flag.
 	LazyConnection lazyconn.State
 
+	// ForceRelay is the initial transport policy. Runtime changes are kept on
+	// Engine and propagated to existing peer connections.
+	ForceRelay bool
+
 	MTU uint16
 
 	// for debug bundle generation
@@ -261,6 +266,7 @@ type Engine struct {
 	stateManager       *statemanager.Manager
 	portForwardManager *portforward.Manager
 	srWatcher          *guard.SRWatcher
+	forceRelay         atomic.Bool
 
 	afpacketCapture *capture.AFPacketCapture
 
@@ -360,6 +366,12 @@ func NewEngine(
 		updateManager:      services.UpdateManager,
 		syncStoreDir:       config.StateDir,
 	}
+	forceRelay := config.ForceRelay
+	if runtime.GOOS == "js" {
+		forceRelay = true
+	}
+	engine.forceRelay.Store(forceRelay)
+	engine.config.ForceRelay = forceRelay
 	// sessionWatcher keeps the SubscribeStatus consumers in sync with the
 	// session expiry deadline. Deadline-change ticks come for free via
 	// Status.SetSessionExpiresAt; the watcher exists to push a wake-up at
@@ -401,6 +413,120 @@ func (e *Engine) Stop() error {
 	log.Infof("stopped Netbird Engine")
 
 	return nil
+}
+
+// SetForceRelay updates the engine transport policy without restarting the
+// engine. Existing open peers preserve an available path while switching when
+// possible; closed lazy peers use the new policy when activated.
+func (e *Engine) SetForceRelay(enabled bool) error {
+	if runtime.GOOS == "js" && !enabled {
+		return errors.New("force relay cannot be disabled on js")
+	}
+
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+
+	if err := e.ctx.Err(); err != nil {
+		return fmt.Errorf("engine is stopped: %w", err)
+	}
+	e.forceRelay.Store(enabled)
+	// Enable the base monitor before adding ICE. When enabling force relay,
+	// pending peers acquire per-peer monitor requirements before the base policy
+	// is disabled below, avoiding a stop/start gap in candidate observation.
+	if !enabled && e.srWatcher != nil {
+		e.srWatcher.SetICEMonitorEnabled(true)
+	}
+
+	reconfigurationStart := time.Now()
+	reconfigured := 0
+	var reconfigureErr error
+	if e.peerStore != nil {
+		reconfigured, reconfigureErr = reconfigureForceRelayPeers(
+			e.peerStore.PeersPubKey(),
+			func(peerKey string) (bool, error) {
+				conn, ok := e.peerStore.PeerConn(peerKey)
+				if !ok {
+					return false, nil
+				}
+				return conn.ReconfigureForceRelay(e.ctx, enabled)
+			},
+		)
+	}
+	if enabled && e.srWatcher != nil {
+		e.srWatcher.SetICEMonitorEnabled(false)
+	}
+
+	log.Infof(
+		"force-relay runtime request updated to %t; reconfigured %d open peers in %s",
+		enabled,
+		reconfigured,
+		time.Since(reconfigurationStart).Round(time.Millisecond),
+	)
+	return reconfigureErr
+}
+
+// WGIface serializes device writes. This limit bounds peer work while allowing
+// peer-local stabilization waits and signaling to overlap.
+const maxConcurrentForceRelayReconfigurations = 8
+
+type forceRelayReconfigurationResult struct {
+	reconfigured bool
+	err          error
+}
+
+func reconfigureForceRelayPeers(
+	peerKeys []string,
+	reconfigure func(string) (bool, error),
+) (int, error) {
+	if len(peerKeys) == 0 {
+		return 0, nil
+	}
+
+	results := make([]forceRelayReconfigurationResult, len(peerKeys))
+	jobs := make(chan int)
+	workerCount := min(maxConcurrentForceRelayReconfigurations, len(peerKeys))
+
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				reconfigured, err := reconfigure(peerKeys[index])
+				results[index] = forceRelayReconfigurationResult{
+					reconfigured: reconfigured,
+					err:          err,
+				}
+			}
+		}()
+	}
+
+	for index := range peerKeys {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+
+	var merr *multierror.Error
+	reconfigured := 0
+	for index, result := range results {
+		if result.err != nil {
+			merr = multierror.Append(
+				merr,
+				fmt.Errorf("reconfigure peer %s: %w", peerKeys[index], result.err),
+			)
+			continue
+		}
+		if result.reconfigured {
+			reconfigured++
+		}
+	}
+	return reconfigured, nberrors.FormatErrorOrNil(merr)
+}
+
+// ForceRelayEnabled reports the engine-owned transport policy.
+func (e *Engine) ForceRelayEnabled() bool {
+	return e.forceRelay.Load()
 }
 
 // stopLocked tears down everything Start may have brought up, in the order
@@ -685,7 +811,7 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	})
 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
-	e.srWatcher.Start(peer.IsForceRelayed())
+	e.srWatcher.Start(e.forceRelay.Load())
 
 	if err = e.receiveSignalEvents(); err != nil {
 		return err
@@ -1904,8 +2030,9 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 			Addr:           e.getRosenpassAddr(),
 			PermissiveMode: e.config.RosenpassPermissive,
 		},
-		ICEConfig: e.createICEConfig(),
-		NetMgr:    e.netMgr,
+		ICEConfig:  e.createICEConfig(),
+		NetMgr:     e.netMgr,
+		ForceRelay: e.forceRelay.Load(),
 	}
 
 	serviceDependencies := peer.ServiceDependencies{

@@ -344,7 +344,7 @@ func (w *WorkerICE) connect(ctx context.Context, agent *icemaker.ThreadSafeAgent
 	w.muxAgent.Unlock()
 
 	// todo: the potential problem is a race between the onConnectionStateChange
-	w.conn.onICEConnectionIsReady(selectedPriority(pair), ci)
+	w.conn.onICEConnectionIsReady(w, selectedPriority(pair), ci)
 }
 
 func (w *WorkerICE) closeAgent(agent *icemaker.ThreadSafeAgent, cancel context.CancelFunc) bool {
@@ -573,7 +573,7 @@ func (w *WorkerICE) onConnectionStateChange(agent *icemaker.ThreadSafeAgent, dia
 
 			if w.lastKnownState == ice.ConnectionStateConnected {
 				w.lastKnownState = ice.ConnectionStateDisconnected
-				w.conn.onICEStateDisconnected(sessionChanged)
+				w.conn.onICEStateDisconnected(w, sessionChanged)
 			}
 		default:
 			return

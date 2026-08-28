@@ -1,9 +1,12 @@
 package peer
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
+	relayClient "github.com/netbirdio/netbird/shared/relay/client"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
@@ -60,4 +63,87 @@ func TestHandshakerKeepsLatestSignalBeforeListen(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		assert.Fail(t, "remote-answer dispatch: queued signal was dropped")
 	}
+}
+
+func TestBuildOfferAnswerAdvertisesLocalICEWhenRemoteDoesNot(t *testing.T) {
+	const (
+		localUFrag = "local-ufrag"
+		localPwd   = "local-password"
+		localSID   = ICESessionID("0102030405")
+	)
+
+	h := newOfferTestHandshaker(&WorkerICE{
+		localUfrag: localUFrag,
+		localPwd:   localPwd,
+		sessionID:  localSID,
+	})
+	h.remoteICESupported.Store(false)
+
+	offer := h.buildOfferAnswer()
+	if offer.IceCredentials.UFrag != localUFrag || offer.IceCredentials.Pwd != localPwd {
+		t.Fatalf("buildOfferAnswer ICE credentials = %+v, want ufrag %q and password %q", offer.IceCredentials, localUFrag, localPwd)
+	}
+	if offer.SessionID == nil || *offer.SessionID != localSID {
+		t.Fatalf("buildOfferAnswer session ID = %v, want %s", offer.SessionID, localSID)
+	}
+}
+
+func TestBuildOfferAnswerOmitsICEWithoutLocalWorker(t *testing.T) {
+	h := newOfferTestHandshaker(nil)
+	h.remoteICESupported.Store(true)
+
+	offer := h.buildOfferAnswer()
+	if offer.hasICECredentials() {
+		t.Fatalf("buildOfferAnswer unexpectedly advertised ICE credentials: %+v", offer.IceCredentials)
+	}
+	if offer.SessionID != nil {
+		t.Fatalf("buildOfferAnswer unexpectedly advertised ICE session ID: %s", offer.SessionID)
+	}
+}
+
+func TestHandshakerSetICEWorkerSerializesOfferConstruction(t *testing.T) {
+	workerICE := &WorkerICE{
+		localUfrag: "local-ufrag",
+		localPwd:   "local-password",
+		sessionID:  ICESessionID("0102030405"),
+	}
+	h := newOfferTestHandshaker(nil)
+
+	const iterations = 1000
+	start := make(chan struct{})
+	invalidOffer := make(chan OfferAnswer, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			h.setICEWorker(workerICE)
+			h.setICEWorker(nil)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			offer := h.buildOfferAnswer()
+			if offer.hasICECredentials() != (offer.SessionID != nil) {
+				invalidOffer <- offer
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	select {
+	case offer := <-invalidOffer:
+		t.Fatalf("offer observed a partial ICE update: %+v", offer)
+	default:
+	}
+}
+
+func newOfferTestHandshaker(ice *WorkerICE) *Handshaker {
+	relayManager := relayClient.NewManager(context.Background(), nil, "test-peer", 1280)
+	return NewHandshaker(nil, ConnConfig{}, nil, ice, &WorkerRelay{relayManager: relayManager}, nil)
 }

@@ -75,6 +75,8 @@ type ConnectClient struct {
 	// netMgr gates every reconnection loop on OS-reported network
 	// availability and sweeps connections on network change.
 	netMgr *netevents.Manager
+
+	forceRelay atomic.Bool
 }
 
 // ConnectClientOption configures optional ConnectClient behavior.
@@ -83,6 +85,11 @@ type ConnectClientOption func(*ConnectClient)
 // WithNetEvents injects the OS network event handling.
 func WithNetEvents(events *netevents.Manager) ConnectClientOption {
 	return func(c *ConnectClient) { c.netMgr = events }
+}
+
+// WithForceRelay sets the transport policy used by the next engine instance.
+func WithForceRelay(enabled bool) ConnectClientOption {
+	return func(c *ConnectClient) { c.forceRelay.Store(enabled) }
 }
 
 func NewConnectClient(
@@ -103,6 +110,7 @@ func NewConnectClient(
 		statusRecorder: statusRecorder,
 		engineMutex:    sync.Mutex{},
 	}
+	c.forceRelay.Store(peer.IsForceRelayed())
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -415,6 +423,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			log.Error(err)
 			return wrapErr(err)
 		}
+		engineConfig.ForceRelay = c.forceRelay.Load()
 		engineConfig.TempDir = mobileDependency.TempDir
 		// Leave StateDir empty when there is no state path so a disk-backed
 		// syncstore falls back to os.TempDir() instead of filepath.Dir("") == ".".
@@ -553,6 +562,21 @@ func (c *ConnectClient) Engine() *Engine {
 	return e
 }
 
+// SetForceRelay stores the desired transport policy and applies it immediately
+// when an engine is available. Before engine initialization it is queued for
+// the engine created by run.
+func (c *ConnectClient) SetForceRelay(enabled bool) error {
+	c.forceRelay.Store(enabled)
+	if c.ctx.Err() != nil {
+		return nil
+	}
+	engine := c.Engine()
+	if engine == nil {
+		return nil
+	}
+	return engine.SetForceRelay(enabled)
+}
+
 // GetLatestSyncResponse returns the latest sync response from the engine.
 func (c *ConnectClient) GetLatestSyncResponse() (*mgmProto.SyncResponse, error) {
 	engine := c.Engine()
@@ -669,6 +693,7 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 		SyncMessageVersion:  config.SyncMessageVersion,
 
 		LazyConnection: lazyconn.ParseState(config.LazyConnection),
+		ForceRelay:     peer.IsForceRelayed(),
 
 		MTU:     selectMTU(config.MTU, peerConfig.Mtu),
 		LogPath: logPath,

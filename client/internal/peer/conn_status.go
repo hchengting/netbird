@@ -17,11 +17,13 @@ const (
 // tri-state connection classification. Extracted so the decision logic can be unit-tested
 // without constructing full Worker/Handshaker objects.
 type connStatusInputs struct {
-	forceRelay          bool // NB_FORCE_RELAY or JS/WASM
+	forceRelayApplied   bool // relay-only mode is active on this peer
+	forceRelayPending   bool // relay-only is requested while ICE remains active
 	peerUsesRelay       bool // remote peer advertises relay support AND local has relay
 	relayConnected      bool // statusRelay reports Connected (independent of whether peer uses relay)
 	remoteSupportsICE   bool // remote peer sent ICE credentials
 	iceWorkerCreated    bool // local WorkerICE exists (false in force-relay mode)
+	iceConnected        bool // statusICE reports Connected
 	iceStatusConnecting bool // statusICE is anything other than Disconnected
 	iceInProgress       bool // a negotiation is currently in flight
 }
