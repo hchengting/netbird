@@ -305,10 +305,22 @@ func (c *Client) SetNetworkAvailable(available bool) {
 
 // NotifyNetworkChange marks the management, signal and relay connections
 // stale after the OS switched networks and schedules a sweep that cuts
-// whatever has not redialed on the new network by then. The engine and the
-// TUN device stay untouched.
+// whatever has not redialed on the new network by then. It also drops the peer
+// sessions bound to the transport that went away, so they renegotiate on the
+// new one instead of waiting out the ICE timeouts. The engine and the TUN device
+// stay untouched.
 func (c *Client) NotifyNetworkChange() {
 	c.netMgr.NotifyNetworkChange()
+
+	// The peer teardown closes ICE agents, which blocks. The caller is an OS
+	// connectivity callback, so do it off the calling thread.
+	go func() {
+		if cc := c.getConnectClient(); cc != nil {
+			if e := cc.Engine(); e != nil {
+				e.NotifyNetworkChange()
+			}
+		}
+	}()
 }
 
 // DebugBundle generates a debug bundle, uploads it, and returns the upload key.
