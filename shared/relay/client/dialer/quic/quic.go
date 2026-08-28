@@ -56,14 +56,14 @@ func (d Dialer) Dial(ctx context.Context, address, serverName string) (net.Conn,
 		Tracer:            connectionTracer(quicURL),
 	}
 
+	udpAddr, err := nbnet.NewControlPlaneDialer().ResolveUDPAddr(ctx, "udp", quicURL)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", quicURL, err)
+	}
+
 	udpConn, err := nbnet.ListenUDP("udp", &net.UDPAddr{Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("listen udp: %w", err)
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", quicURL)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", quicURL, err)
 	}
 
 	session, err := quic.Dial(ctx, udpConn, udpAddr, tlsClientConfig, quicConfig)
